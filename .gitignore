@@ -1,0 +1,11 @@
+bin
+C
+D
+doc
+lib
+libexec
+include
+launch.sh
+share
+.zig-cache
+zig-out

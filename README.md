@@ -15,6 +15,17 @@ Reasons for doing this :
 - Get familiar with using embedded asm in Zig
 - Because the Atari ST is the future of computers
 
+## Inspirations
+
+This Youtube playlist that covers low level programming on the Atari ST
+
+https://www.youtube.com/watch?v=mXTR_bBorsk&list=PLp_QNRIYljFrtuifgkvLpb88vvKQf2xUD
+
+
+This project that demonstrates Rust / Zig / Swift toolchains  to build for the Atari
+
+https://github.com/DominoTree/modern-m68k-toolchains
+
 ## What
 
 Sub projects under this project:

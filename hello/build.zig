@@ -31,18 +31,23 @@ pub fn build(b: *std.Build) void {
         \\DIR="$(mktemp -d)"
         \\m68k-elf-ld --gc-sections --script "$1" -o "$DIR/hello.elf" "$0"
         \\
-        \\# Find _start offset in the ELF (relative to text section)
-        \\START_HEX=$(m68k-elf-nm "$DIR/hello.elf" | awk '$3=="_start"{print $1}')
-        \\START_DEC=$((16#$START_HEX))
+        \\TEXT_SZ=$(m68k-elf-size -A "$DIR/hello.elf" | awk '/^\.text/{print $2}')
+        \\DATA_SZ=$(m68k-elf-size -A "$DIR/hello.elf" | awk '/^\.data/{print $2}')
+        \\BSS_SZ=$(m68k-elf-size -A "$DIR/hello.elf"  | awk '/^\.bss/{print $2}')
+        \\START_VMA=$(m68k-elf-nm "$DIR/hello.elf" | awk '$3=="_start"{print $1}')
+        \\DISP=$((16#$START_VMA - 2))
         \\
-        \\# Build the 28-byte GEMDOS header:
-        \\#   bytes 0-1: BRA.W with displacement = _start_addr - 2
-        \\#   bytes 2-27: zero
-        \\DISP=$((START_DEC - 2))
-        \\HI=$(( (DISP >> 8) & 0xFF ))
-        \\LO=$(( DISP & 0xFF ))
-        \\printf "\\x60\\x$(printf '%02x' $HI)\\x$(printf '%02x' $LO)" > "$DIR/header.bin"
-        \\dd if=/dev/zero bs=26 count=1 >> "$DIR/header.bin" 2>/dev/null
+        \\python3 -c "
+        \\import struct, sys
+        \\disp = $DISP
+        \\hdr = struct.pack('>2s6Ih',
+        \\    b'\\x60' + bytes([disp]),      # BRA.S to _start
+        \\    $TEXT_SZ, $DATA_SZ, $BSS_SZ,   # segment sizes
+        \\    0, 0, 0, 1,                    # sym, reserved, flags, absflag
+        \\)
+        \\assert len(hdr) == 28
+        \\sys.stdout.buffer.write(hdr)
+        \\" > "$DIR/header.bin"
         \\
         \\m68k-elf-objcopy -O binary "$DIR/hello.elf" "$DIR/hello.bin"
         \\cat "$DIR/header.bin" "$DIR/hello.bin" > ~/Atari/CDrive/HELLO.PRG

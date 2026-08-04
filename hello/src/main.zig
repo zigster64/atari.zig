@@ -30,7 +30,67 @@ const AesPb = extern struct {
     addr_out: [*]?[*]u8,
 };
 
-// aes_trap: dispatch an AES call. d0 = 0xC8 identifies XGEMDOS, d1 = pb ptr.
+// AES populates app_id in global at appl_init; must persist across app lifetime.
+var GLOBAL: AesGlobal = .{
+    .version = 0,
+    .app_max = 0,
+    .app_id = 0,
+    .user = 0,
+    .rsc = null,
+    .reserved = .{0} ** 4,
+};
+
+// ── Entry point — keep first so it lands at the top of the binary ─────────
+
+export fn _start() callconv(.c) noreturn {
+    const ap_id = appl_init();
+    if (ap_id < 0) {
+        pterm0();
+    }
+
+    const NAME: i16 = 0x0001;
+    const CLOSE: i16 = 0x0002;
+    const MOVER: i16 = 0x0004;
+    const kind = NAME | CLOSE | MOVER;
+
+    const handle = wind_create(kind, 50, 50, 300, 150);
+    if (handle > 0) {
+        wind_set_str(handle, 2, "All your GEM are belong to Zig");
+        wind_open(handle, 50, 50, 300, 150);
+        _ = evnt_mesag(); // wait for user to click close or quit
+        wind_close(handle);
+        wind_delete(handle);
+    }
+
+    appl_exit();
+    pterm0();
+}
+
+// ── Required stubs — keep near the top ────────────────────────────────────
+
+export fn abort() noreturn {
+    pterm0();
+}
+
+export fn memset(dest: [*]u8, c: i32, n: usize) [*]u8 {
+    var i: usize = 0;
+    const byte: u8 = @truncate(@as(u32, @bitCast(c)));
+    while (i < n) : (i += 1) dest[i] = byte;
+    return dest;
+}
+
+// ── Pterm0 — clean exit via GEMDOS trap #1 ───────────────────────────────
+
+fn pterm0() noreturn {
+    asm volatile (
+        \\move.w #0, -(%%sp)
+        \\trap #1
+        ::: .{ .memory = true });
+    unreachable;
+}
+
+// ── AES trap dispatch ─────────────────────────────────────────────────────
+
 fn aes_trap(pb: *const AesPb) void {
     asm volatile (
         \\move.l %[pb], %%d1
@@ -41,7 +101,6 @@ fn aes_trap(pb: *const AesPb) void {
         : .{ .memory = true });
 }
 
-// Build a parameter block on the stack and dispatch. Returns int_out[0].
 fn aes_call(opcode: u16, int_in: []const i16, addr_in: []const ?[*]const u8, n_out: u16) i16 {
     var control = AesControl{
         .opcode = opcode,
@@ -65,16 +124,6 @@ fn aes_call(opcode: u16, int_in: []const i16, addr_in: []const ?[*]const u8, n_o
     aes_trap(&pb);
     return int_out[0];
 }
-
-// AES populates app_id in global at appl_init; must persist across app lifetime.
-var GLOBAL: AesGlobal = .{
-    .version = 0,
-    .app_max = 0,
-    .app_id = 0,
-    .user = 0,
-    .rsc = null,
-    .reserved = .{0} ** 4,
-};
 
 // ── GEM helper wrappers ───────────────────────────────────────────────────
 
@@ -116,53 +165,4 @@ fn evnt_mesag() i16 {
     const int_in = [_]i16{0x0010} ** 16;
     const addr_in = [_]?[*]const u8{null};
     return aes_call(25, &int_in, &addr_in, 7);
-}
-
-// ── Pterm0 — clean exit via GEMDOS trap #1 ───────────────────────────────
-
-fn pterm0() noreturn {
-    asm volatile (
-        \\move.w #0, -(%%sp)
-        \\trap #1
-        ::: .{ .memory = true });
-    unreachable;
-}
-
-// ── Entry point ───────────────────────────────────────────────────────────
-
-export fn _start() callconv(.c) noreturn {
-    const ap_id = appl_init();
-    if (ap_id < 0) {
-        pterm0();
-    }
-
-    const NAME: i16 = 0x0001;
-    const CLOSE: i16 = 0x0002;
-    const MOVER: i16 = 0x0004;
-    const kind = NAME | CLOSE | MOVER;
-
-    const handle = wind_create(kind, 50, 50, 300, 150);
-    if (handle > 0) {
-        wind_set_str(handle, 2, "Zig 0.16 on m68k GEM");
-        wind_open(handle, 50, 50, 300, 150);
-        _ = evnt_mesag();   // wait for user to click close or quit
-        wind_close(handle);
-        wind_delete(handle);
-    }
-
-    appl_exit();
-    pterm0();
-}
-
-// ── Required stubs (LLVM / compiler-rt may emit calls to these) ───────────
-
-export fn abort() noreturn {
-    pterm0();
-}
-
-export fn memset(dest: [*]u8, c: i32, n: usize) [*]u8 {
-    var i: usize = 0;
-    const byte: u8 = @truncate(@as(u32, @bitCast(c)));
-    while (i < n) : (i += 1) dest[i] = byte;
-    return dest;
 }

@@ -8,6 +8,16 @@ The scope of this project is to setup a Zig build toolchain for Atari ST, which 
 - Some simple zig programs that compile to Atari ST .PRG format
 - A zig native library that wraps GEM & VDI functions in idiomatic Zig wrappers
 
+## Getting started
+
+Get some basics installed first - will save much heartache down the track !
+
+```
+brew install m68k-elf-binutils
+brew install frno7/toslibc/toslink
+brew install hatari
+```
+
 ## Why
 
 Reasons for doing this :
@@ -44,6 +54,10 @@ You should be able to 1 shot this script and end up with a complete m68k zig too
 Its running in -j2 to restrict the amount of memory that the build needs ... so you can run this on a 16GB mac.
 
 Whole build process takes a while - expect it to take around an hour ?
+
+After successfully building this, you will also need to install m68k-elf-binutils to be able to build Zig programs
+
+`brew install m68k-elf-binutils`
 
 ### hello/
 

@@ -1,15 +1,14 @@
 const std = @import("std");
-const Io = std.Io;
-
-const prgify = @import("prgify");
+const prgify = @import("prgify.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+
+    if (args.len < 2) {
+        std.debug.print("usage: {s} <input.elf> [output.prg]\n", .{args[0]});
+        std.process.exit(1);
     }
 
-    const io = init.io;
-    _ = io; // autofix
+    try prgify.convert(arena, init.io, args[1], if (args.len > 2) args[2] else "out.prg");
 }

@@ -55,9 +55,10 @@ Its running in -j2 to restrict the amount of memory that the build needs ... so 
 
 Whole build process takes a while - expect it to take around an hour ?
 
-After successfully building this, you will also need to install m68k-elf-binutils to be able to build Zig programs
+End result is that you will have a whole build toolchain setup in ~/Atari/bin, including Zig, LLVM, and the 'prgify' binary that is 
+used to convert m68k ELF format compiler output to Atari ST .PRG format files.
 
-`brew install m68k-elf-binutils`
+This is basically just a header prepended to the ELF binary, with information about the correct address offset for the _start() function.
 
 ### hello/
 

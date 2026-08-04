@@ -1,8 +1,9 @@
-ENTRY(_start)
+ENTRY(_startup)
 
 SECTIONS
 {
     .text : ALIGN(4) {
+        KEEP(*(.text._startup))
         *(.text._start)
         *(.text)
         *(.text.*)

@@ -1,8 +1,20 @@
-// GEM "Hello World" for Atari TOS / EmuTOS — m68k, freestanding, no std lib.
-// Inline asm follows the LLVM m68k GAS dialect (%%registers, no CLR).
-// Patterns informed by DominoTree/modern-m68k-toolchains.
+// Zig hello-world for EmuTOS / Atari TOS that opens a GEM form_alert
+// dialog instead of printing to the console. No std lib, every system
+// call is inline m68k asm.
+//
+// Calling conventions used:
+//   GEMDOS (trap #1) — pop function word + args from user stack
+//   AES    (trap #2) — d0 = 0xC8, d1 = &aes_pb
+const std = @import("std");
+const builtin = @import("builtin");
+const build_info = @import("build_info.zig");
 
-// ── AES parameter block (trap #2, d0 = 0xC8) ─────────────────────────────
+// form_alert grammar: `[icon][line1|line2|...][btn1|btn2|...]`.
+// Icons: 0=none, 1=note, 2=question, 3=stop.
+const ALERT_TEXT: [*:0]const u8 = "[1][All your base|are belong to|Zig " ++
+    builtin.zig_version_string ++ "|" ++ build_info.llvm_version ++ "][ OK ]";
+
+// ---------- AES parameter block (XGEMDOS opcode 0xC8, trap #2) ----------
 
 const AesControl = extern struct {
     opcode: u16,
@@ -30,66 +42,16 @@ const AesPb = extern struct {
     addr_out: [*]?[*]u8,
 };
 
-// AES populates app_id in global at appl_init; must persist across app lifetime.
+// AES populates app_id in `global` at appl_init and references it on later
+// calls — must persist across the whole app lifetime.
 var GLOBAL: AesGlobal = .{
     .version = 0,
     .app_max = 0,
     .app_id = 0,
     .user = 0,
     .rsc = null,
-    .reserved = .{0} ** 4,
+    .reserved = .{ 0, 0, 0, 0 },
 };
-
-// ── Entry point — keep first so it lands at the top of the binary ─────────
-
-export fn _start() callconv(.c) noreturn {
-    const ap_id = appl_init();
-    if (ap_id < 0) {
-        pterm0();
-    }
-
-    const NAME: i16 = 0x0001;
-    const CLOSE: i16 = 0x0002;
-    const MOVER: i16 = 0x0004;
-    const kind = NAME | CLOSE | MOVER;
-
-    const handle = wind_create(kind, 50, 50, 300, 150);
-    if (handle > 0) {
-        wind_set_str(handle, 2, "All your GEM are belong to Zig");
-        wind_open(handle, 50, 50, 300, 150);
-        _ = evnt_mesag(); // wait for user to click close or quit
-        wind_close(handle);
-        wind_delete(handle);
-    }
-
-    appl_exit();
-    pterm0();
-}
-
-// ── Required stubs — keep near the top ────────────────────────────────────
-
-export fn abort() noreturn {
-    pterm0();
-}
-
-export fn memset(dest: [*]u8, c: i32, n: usize) [*]u8 {
-    var i: usize = 0;
-    const byte: u8 = @truncate(@as(u32, @bitCast(c)));
-    while (i < n) : (i += 1) dest[i] = byte;
-    return dest;
-}
-
-// ── Pterm0 — clean exit via GEMDOS trap #1 ───────────────────────────────
-
-fn pterm0() noreturn {
-    asm volatile (
-        \\move.w #0, -(%%sp)
-        \\trap #1
-        ::: .{ .memory = true });
-    unreachable;
-}
-
-// ── AES trap dispatch ─────────────────────────────────────────────────────
 
 fn aes_trap(pb: *const AesPb) void {
     asm volatile (
@@ -101,18 +63,25 @@ fn aes_trap(pb: *const AesPb) void {
         : .{ .memory = true });
 }
 
-fn aes_call(opcode: u16, int_in: []const i16, addr_in: []const ?[*]const u8, n_out: u16) i16 {
-    var control = AesControl{
+// Build a parameter block on the stack and dispatch. int_out[0] is the
+// implicit AES return code; declared int_out params start at index 1. 7 is
+// the AES per-call maximum.
+fn aes_call(
+    opcode: u16,
+    int_in: []const i16,
+    addr_in: []const ?[*]const u8,
+) i16 {
+    var control: AesControl = .{
         .opcode = opcode,
         .n_int_in = @intCast(int_in.len),
-        .n_int_out = n_out,
+        .n_int_out = 1,
         .n_addr_in = @intCast(addr_in.len),
         .n_addr_out = 0,
     };
-    var int_out: [7]i16 = .{0} ** 7;
+    var int_out: [7]i16 = .{ 0, 0, 0, 0, 0, 0, 0 };
     var addr_out: [1]?[*]u8 = .{null};
 
-    const pb = AesPb{
+    const pb: AesPb = .{
         .control = &control,
         .global = &GLOBAL,
         .int_in = if (int_in.len == 0) null else int_in.ptr,
@@ -125,44 +94,56 @@ fn aes_call(opcode: u16, int_in: []const i16, addr_in: []const ?[*]const u8, n_o
     return int_out[0];
 }
 
-// ── GEM helper wrappers ───────────────────────────────────────────────────
-
 fn appl_init() i16 {
-    return aes_call(10, &.{}, &.{}, 1);
+    return aes_call(10, &.{}, &.{});
 }
 
-fn appl_exit() void {
-    _ = aes_call(19, &.{}, &.{}, 1);
+fn appl_exit() i16 {
+    return aes_call(19, &.{}, &.{});
 }
 
-fn wind_create(kind: i16, x: i16, y: i16, w: i16, h: i16) i16 {
-    const int_in = [_]i16{ kind, x, y, w, h };
-    return aes_call(100, &int_in, &.{}, 1);
+// form_alert: int_in=[default_button], addr_in=[alert_string].
+fn form_alert(default_button: i16, text: [*:0]const u8) i16 {
+    const int_in = [_]i16{default_button};
+    const addr_in = [_]?[*]const u8{@ptrCast(text)};
+    return aes_call(52, &int_in, &addr_in);
 }
 
-fn wind_open(handle: i16, x: i16, y: i16, w: i16, h: i16) void {
-    const int_in = [_]i16{ handle, x, y, w, h };
-    _ = aes_call(101, &int_in, &.{}, 1);
+// ---------- Entry point ----------
+
+export fn _start() callconv(.c) noreturn {
+    const ap_id = appl_init();
+    if (ap_id != -1) {
+        _ = form_alert(1, ALERT_TEXT);
+        _ = appl_exit();
+    }
+    pterm0();
 }
 
-fn wind_close(handle: i16) void {
-    const int_in = [_]i16{handle};
-    _ = aes_call(102, &int_in, &.{}, 1);
+// GEMDOS Pterm0 (trap #1, function 0): clean process exit.
+fn pterm0() noreturn {
+    asm volatile (
+        \\move.w #0, -(%%sp)
+        \\trap #1
+        ::: .{ .memory = true });
+    unreachable;
 }
 
-fn wind_delete(handle: i16) void {
-    const int_in = [_]i16{handle};
-    _ = aes_call(103, &int_in, &.{}, 1);
+// LLVM may emit calls to abort() along the panic path. Resolve cleanly.
+export fn abort() noreturn {
+    pterm0();
 }
 
-fn wind_set_str(handle: i16, field: i16, s: [*:0]const u8) void {
-    const int_in = [_]i16{ handle, field };
-    const addr_in = [_]?[*]const u8{@ptrCast(s)};
-    _ = aes_call(105, &int_in, &addr_in, 1);
+// LLVM lowers struct zero-init to memset. compiler_rt's memset thunk uses
+// 68020+ insns we can't run on 68000, so provide our own.
+export fn memset(dest: [*]u8, c: i32, n: usize) [*]u8 {
+    var i: usize = 0;
+    const byte: u8 = @truncate(@as(u32, @bitCast(c)));
+    while (i < n) : (i += 1) dest[i] = byte;
+    return dest;
 }
 
-fn evnt_mesag() i16 {
-    const int_in = [_]i16{0x0010} ** 16;
-    const addr_in = [_]?[*]const u8{null};
-    return aes_call(25, &int_in, &addr_in, 7);
+pub const panic = std.debug.FullPanic(panicImpl);
+fn panicImpl(_: []const u8, _: ?usize) noreturn {
+    abort();
 }

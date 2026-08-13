@@ -22,35 +22,38 @@ pub fn main() !void {
     const app = try gemz.app.init();
     defer app.exit();
 
+    // TEMP DEBUG: prove boot/init works before the window + event loop.
+    app.form_alert(.default_button, "boot ok");
+
     // Object tree: root box (0), banner text (1), " Alert " button (2),
     // " Close " button (3).
     var tree = [_]gemz.Object{
         .{
-            .ob_next = -1, .ob_head = 1, .ob_tail = 3,
-            .ob_type = @intFromEnum(gemz.ObjectType.box),
-            .ob_flags = 0, .ob_state = 0, .ob_spec = null,
-            .ob_x = 0, .ob_y = 0, .ob_w = 320, .ob_h = 200,
+            .next = -1, .head = 1, .tail = 3,
+            .object_type = .box,
+            .flags = 0, .state = 0, .spec = null,
+            .x = 0, .y = 0, .w = 320, .h = 200,
         },
         .{
-            .ob_next = 2, .ob_head = -1, .ob_tail = -1,
-            .ob_type = @intFromEnum(gemz.ObjectType.text),
-            .ob_flags = 0, .ob_state = 0,
-            .ob_spec = "This is a demo of GEMZ functions",
-            .ob_x = 8, .ob_y = 8, .ob_w = 300, .ob_h = 20,
+            .next = 2, .head = -1, .tail = -1,
+            .object_type = .text,
+            .flags = 0, .state = 0,
+            .spec = "This is a demo of GEMZ functions",
+            .x = 8, .y = 8, .w = 300, .h = 20,
         },
         .{
-            .ob_next = 3, .ob_head = -1, .ob_tail = -1,
-            .ob_type = @intFromEnum(gemz.ObjectType.button),
-            .ob_flags = gemz.ObjectFlag.selectable,
-            .ob_state = 0, .ob_spec = " Alert ",
-            .ob_x = 8, .ob_y = 140, .ob_w = 80, .ob_h = 24,
+            .next = 3, .head = -1, .tail = -1,
+            .object_type = .button,
+            .flags = gemz.ObjectFlag.selectable,
+            .state = 0, .spec = " Alert ",
+            .x = 8, .y = 140, .w = 80, .h = 24,
         },
         .{
-            .ob_next = -1, .ob_head = -1, .ob_tail = -1,
-            .ob_type = @intFromEnum(gemz.ObjectType.button),
-            .ob_flags = gemz.ObjectFlag.selectable | gemz.ObjectFlag.exit,
-            .ob_state = 0, .ob_spec = " Close ",
-            .ob_x = 96, .ob_y = 140, .ob_w = 80, .ob_h = 24,
+            .next = -1, .head = -1, .tail = -1,
+            .object_type = .button,
+            .flags = gemz.ObjectFlag.selectable | gemz.ObjectFlag.exit,
+            .state = 0, .spec = " Close ",
+            .x = 96, .y = 140, .w = 80, .h = 24,
         },
     };
 

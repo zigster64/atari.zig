@@ -169,17 +169,17 @@ pub const ObjectFlag = struct {
 
 /// A GEM object-tree node (24 bytes, layout per Atari GEM).
 pub const Object = extern struct {
-    ob_next: i16, // next sibling, -1 = none
-    ob_head: i16, // first child, -1 = none
-    ob_tail: i16, // last child, -1 = none
-    ob_type: u16,
-    ob_flags: u16,
-    ob_state: u16,
-    ob_spec: ?[*]const u8, // text label for text/button objects
-    ob_x: i16,
-    ob_y: i16,
-    ob_w: i16,
-    ob_h: i16,
+    next: i16, // next sibling, -1 = none
+    head: i16, // first child, -1 = none
+    tail: i16, // last child, -1 = none
+    object_type: ObjectType,
+    flags: u16,
+    state: u16,
+    spec: ?[*]const u8, // text label for text/button objects
+    x: i16,
+    y: i16,
+    w: i16,
+    h: i16,
 };
 
 /// Message types delivered through `evnt_multi`'s message buffer.

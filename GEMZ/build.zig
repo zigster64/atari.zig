@@ -68,4 +68,10 @@ pub fn build(b: *std.Build) void {
     // Install the .PRG to ./zig-out/atari/HELLO.PRG.
     const install_prg = b.addInstallFileWithDir(prg, .{ .custom = "atari" }, "HELLO.PRG");
     b.getInstallStep().dependOn(&install_prg.step);
+
+    // Also copy it into the Hatari C: drive for testing.
+    const install_cd = b.addSystemCommand(&.{ "sh", "-c" });
+    install_cd.addArg("mkdir -p ~/Atari/CDrive/GEMZ && cp \"$0\" ~/Atari/CDrive/GEMZ/DEMO.PRG");
+    install_cd.addFileArg(prg);
+    b.getInstallStep().dependOn(&install_cd.step);
 }

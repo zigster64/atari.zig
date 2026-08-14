@@ -168,4 +168,11 @@ pub fn main() !void {
 
 
 
+### Task 3 - cleanup root.zig
+
+there are a bunch of things that could be improved to use zig enums and other idioms
+
+- aesCall opcodes could be an enum with useful names
+
+- the TedInfo struct has field names that stutter - the 'te_' prefix is redundant
 

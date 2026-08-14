@@ -481,3 +481,30 @@ inquiry, `vs_` = set attribute.
       `FIXME` in toslibc) for object-tree and message handling.
 - [ ] Decide whether the VDI function list should be generated from
       `vdi-call.h` or hand-maintained (risk of drift).
+
+## AES argument conventions — gotchas (learned the hard way)
+
+### wind_set / wind_get pass pointers in int_in, NOT addr_in
+`wind_set(handle, what, ...)` is variadic. Its pointer arguments — the title for
+`WF_NAME` (2), the info line for `WF_INFO` (3) — are passed as the 32-bit address
+split across two 16-bit `int_in` words, not via `addr_in`:
+
+    wind_set(handle, WF_NAME, title)
+    => int_in = [handle, 2, title>>16, title & 0xffff, 0, 0]
+
+Known-good trace: `wind_set(intin: 0x1, 0x2, 0x2, 0xd862, 0x0, 0x0)` — handle 1,
+field 2, then the title pointer `0x0002d862` split into `0x0002, 0xd862`.
+
+Contrast: `objc_draw`, `form_alert`, `rsrc_load` DO take their pointers via
+`addr_in`. The AES is inconsistent — check the doc for each call.
+
+### wind_get(work_xywh) returns screen coordinates (EmuTOS)
+Not window-relative. Do not add `curr_xywh` to it.
+
+### G_TEXT / G_BOXTEXT use a TEDINFO, not a raw string
+EmuTOS dereferences `ob_spec` as a pointer-to-TEDINFO (first field `ptext` is the
+string). `G_BUTTON` and `G_TITLE` take plain strings.
+
+### ob_spec strings must be 2-aligned
+GEM word-accesses text strings; a byte-aligned .rodata literal at an odd address
+causes an address error. Use an `align(2)` buffer.

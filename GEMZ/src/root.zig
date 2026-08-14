@@ -48,7 +48,22 @@ const AesArgs = extern struct {
     n_int_in: u16,
     addr_in: ?[*]const ?[*]const u8,
     n_addr_in: u16,
+    n_int_out: u16,
 
+    /// No inputs (appl_init, appl_exit).
+    pub fn none() AesArgs {
+        return .{ .int_in = null, .n_int_in = 0, .addr_in = null, .n_addr_in = 0, .n_int_out = 1 };
+    }
+
+    /// int_in only; explicit output count.
+    pub fn ints(int_in: anytype, comptime out: u16) AesArgs {
+        return .{ .int_in = int_in, .n_int_in = @intCast(int_in.len), .addr_in = null, .n_addr_in = 0, .n_int_out = out };
+    }
+
+    /// int_in + addr_in; explicit output count.
+    pub fn from(int_in: anytype, addr_in: anytype, comptime out: u16) AesArgs {
+        return .{ .int_in = int_in, .n_int_in = @intCast(int_in.len), .addr_in = addr_in, .n_addr_in = @intCast(addr_in.len), .n_int_out = out };
+    }
 };
 
 /// AES opcodes (trap #2, d0 = $C8). Complete standard set.
@@ -193,7 +208,7 @@ noinline fn aesCall(opcode: AesOpcode, args: *const AesArgs) i16 {
     var control = AesControl{
         .opcode = @intFromEnum(opcode),
         .n_int_in = args.n_int_in,
-        .n_int_out = 7,
+        .n_int_out = args.n_int_out,
         .n_addr_in = args.n_addr_in,
         .n_addr_out = 0,
     };
@@ -438,44 +453,53 @@ pub const AlertButton = enum(i16) {
 
 noinline fn windCreate(kind: u16, x: i16, y: i16, w: i16, h: i16) i16 {
     const int_in = [_]i16{ @bitCast(kind), x, y, w, h };
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    const args = AesArgs.ints(&int_in, 1);
     return aesCall(.wind_create, &args);
 }
 
 noinline fn windOpen(id: i16, x: i16, y: i16, w: i16, h: i16) void {
     const int_in = [_]i16{ id, x, y, w, h };
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    const args = AesArgs.ints(&int_in, 1);
     _ = aesCall(.wind_open, &args);
 }
 
 noinline fn windClose(id: i16) void {
     const int_in = [_]i16{id};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    const args = AesArgs.ints(&int_in, 1);
     _ = aesCall(.wind_close, &args);
 }
 
 noinline fn windDelete(id: i16) void {
     const int_in = [_]i16{id};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    const args = AesArgs.ints(&int_in, 1);
     _ = aesCall(.wind_delete, &args);
 }
 
 noinline fn windSetTitle(id: i16, title: [*:0]const u8) void {
-    const int_in = [_]i16{ id, WindField.name };
-    const addr_in = [_]?[*]const u8{@ptrCast(title)};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    // wind_set passes pointer args in the int_in array (the 32-bit address
+    // split across two words), not via addr_in.
+    const p: u32 = @intFromPtr(title);
+    const int_in = [_]i16{
+        id,
+        WindField.name,
+        @intCast(p >> 16),
+        @intCast(p & 0xffff),
+        0,
+        0,
+    };
+    const args = AesArgs.ints(&int_in, 1);
     _ = aesCall(.wind_set, &args);
 }
 
 noinline fn windSet(id: i16, field: i16, x: i16, y: i16, w: i16, h: i16) void {
     const int_in = [_]i16{ id, field, x, y, w, h };
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    const args = AesArgs.ints(&int_in, 1);
     _ = aesCall(.wind_set, &args);
 }
 
 noinline fn windGet(id: i16, field: i16, out: *Rect) void {
     const int_in = [_]i16{ id, field };
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    const args = AesArgs.ints(&int_in, 5);
     _ = aesCall(.wind_get, &args);
     out.x = aes_out[1];
     out.y = aes_out[2];
@@ -485,7 +509,7 @@ noinline fn windGet(id: i16, field: i16, out: *Rect) void {
 
 noinline fn windUpdate(mode: i16) void {
     const int_in = [_]i16{mode};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    const args = AesArgs.ints(&int_in, 1);
     _ = aesCall(.wind_update, &args);
 }
 
@@ -496,14 +520,14 @@ noinline fn windUpdate(mode: i16) void {
 pub noinline fn objcDraw(tree: []Object, obj: i16, depth: i16, cx: i16, cy: i16, cw: i16, ch: i16) void {
     const int_in = [_]i16{ obj, depth, cx, cy, cw, ch };
     const addr_in = [_]?[*]const u8{@ptrCast(tree.ptr)};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    const args = AesArgs.from(&int_in, &addr_in, 1);
     _ = aesCall(.objc_draw, &args);
 }
 
 noinline fn objcFind(tree: []Object, obj: i16, depth: i16, mx: i16, my: i16) i16 {
     const int_in = [_]i16{ obj, depth, mx, my };
     const addr_in = [_]?[*]const u8{@ptrCast(tree.ptr)};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    const args = AesArgs.from(&int_in, &addr_in, 1);
     return aesCall(.objc_find, &args);
 }
 
@@ -525,7 +549,7 @@ noinline fn evntMulti(message: *[16]i16, ev: *Event) void {
         0, 0, // timer
     };
     const addr_in = [_]?[*]const u8{@ptrCast(message)};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    const args = AesArgs.from(&int_in, &addr_in, 7);
     _ = aesCall(.evnt_multi, &args);
     ev.ev = @bitCast(aes_out[0]);
     ev.mx = aes_out[1];
@@ -539,7 +563,7 @@ noinline fn evntMulti(message: *[16]i16, ev: *Event) void {
 noinline fn grafMouse(mode: i16) void {
     const int_in = [_]i16{mode};
     const addr_in = [_]?[*]const u8{null};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    const args = AesArgs.from(&int_in, &addr_in, 1);
     _ = aesCall(.graf_mouse, &args);
 }
 
@@ -621,7 +645,7 @@ pub const app = struct {
 
     /// `appl_init` — register the application with the AES.
     pub fn init() !app {
-        const args = AesArgs{ .int_in = null, .n_int_in = 0, .addr_in = null, .n_addr_in = 0 };
+        const args = AesArgs.none();
         const id = aesCall(.appl_init, &args);
         if (id == -1) return error.ApplInitFailed;
         return .{ .id = id };
@@ -629,7 +653,7 @@ pub const app = struct {
 
     /// `appl_exit` — release the application from the AES.
     pub fn exit(_: *const app) void {
-        const args = AesArgs{ .int_in = null, .n_int_in = 0, .addr_in = null, .n_addr_in = 0 };
+        const args = AesArgs.none();
         _ = aesCall(.appl_exit, &args);
     }
 
@@ -643,7 +667,7 @@ pub const app = struct {
         const msg: [*:0]const u8 = "[1][" ++ text ++ "][ OK ]";
         const int_in = [_]i16{@intFromEnum(button)};
         const addr_in = [_]?[*]const u8{@ptrCast(msg)};
-        const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+        const args = AesArgs.from(&int_in, &addr_in, 1);
         _ = aesCall(.form_alert, &args);
     }
 
@@ -719,7 +743,7 @@ pub fn alert(comptime text: []const u8) void {
     const msg: [*:0]const u8 = "[1][" ++ text ++ "][ OK ]";
     const int_in = [_]i16{1};
     const addr_in = [_]?[*]const u8{@ptrCast(msg)};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    const args = AesArgs.from(&int_in, &addr_in, 1);
     _ = aesCall(.form_alert, &args);
 }
 
@@ -745,7 +769,7 @@ pub fn alertName(name: []const u8) void {
 
     const int_in = [_]i16{1};
     const addr_in = [_]?[*]const u8{@ptrCast(&buf)};
-    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    const args = AesArgs.from(&int_in, &addr_in, 1);
     _ = aesCall(.form_alert, &args);
 }
 

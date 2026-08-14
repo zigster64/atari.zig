@@ -1,31 +1,31 @@
 const std = @import("std");
 
-// GEMZ build: produces HELLO.PRG from src/hello.zig, which imports the
-// "gemz" module (src/root.zig) as its GEM wrapper library.
+// GEMZ build: produces two Atari ST .PRG programs in ./zig-out/atari/:
 //
-// Pipeline (mirrors ../hello):
-//   zig build-obj (hello.zig + gemz)  ->  HELLO.o
-//   m68k-elf-as src/startup.s          ->  startup.o   (trampoline at text 0)
-//   m68k-elf-ld --relocatable          ->  HELLO.elf   (via prg.ld)
-//   toslink -s                         ->  zig-out/atari/HELLO.PRG
+//   HELLO.PRG  — src/welcome.zig  (classic form_alert welcome dialog)
+//   WINDOW.PRG — src/window.zig   (minimal window + white box)
+//
+// Both import the "gemz" module (src/root.zig) as their GEM wrapper library,
+// and both are copied into ~/Atari/CDrive/GEMZ/ for Hatari.
+//
+// `compileObject` compiles one app to a relocatable m68k object; `linkToPrg`
+// turns that object into an Atari ST .PRG (startup trampoline → ld → toslink)
+// and installs it. Add a new program by compiling one more module and calling
+// `linkToPrg` — the linking pipeline is shared.
 
 pub fn build(b: *std.Build) void {
-    // GEMZ library module. Target is inherited from the importing module
-    // (the hello module below sets m68k-freestanding).
     const gemz = b.addModule("gemz", .{
         .root_source_file = b.path("src/root.zig"),
     });
 
-    // m68k freestanding target (Atari ST / GEMDOS).
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .m68k,
         .os_tag = .freestanding,
         .abi = .none,
     });
 
-    // The hello program, importing the gemz module.
-    const hello = b.createModule(.{
-        .root_source_file = b.path("src/hello.zig"),
+    const welcome = b.createModule(.{
+        .root_source_file = b.path("src/welcome.zig"),
         .target = target,
         .optimize = .ReleaseSmall,
         .imports = &.{
@@ -33,14 +33,37 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Stage 1: Zig -> relocatable m68k ELF object.
+    const window = b.createModule(.{
+        .root_source_file = b.path("src/window.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .imports = &.{
+            .{ .name = "gemz", .module = gemz },
+        },
+    });
+
+    linkToPrg(b, "HELLO", compileObject(b, "HELLO", welcome));
+    linkToPrg(b, "WINDOW", compileObject(b, "WINDOW", window));
+}
+
+/// Compile a module to a relocatable m68k ELF object with `_start` as the
+/// entry symbol (no compiler-rt — this is freestanding).
+fn compileObject(b: *std.Build, comptime name: []const u8, mod: *std.Build.Module) *std.Build.Step.Compile {
     const obj = b.addObject(.{
-        .name = "HELLO",
-        .root_module = hello,
+        .name = name,
+        .root_module = mod,
     });
     obj.entry = .{ .symbol_name = "_start" };
     obj.bundle_compiler_rt = false;
+    return obj;
+}
 
+/// Link a compiled m68k object into an Atari ST .PRG and install it.
+///
+/// Pipeline: startup trampoline (GNU `m68k-elf-as`) → relocatable link
+/// (`m68k-elf-ld` + prg.ld) → `toslink` .PRG → install to ./zig-out/atari and
+/// copy to ~/Atari/CDrive/GEMZ.
+fn linkToPrg(b: *std.Build, comptime name: []const u8, obj: *std.Build.Step.Compile) void {
     // Trampoline: guarantees code at text offset 0 (the PRG entry point).
     // Must be GNU `m68k-elf-as`: zig's bundled LLVM m68k assembler emits
     // `bra.l` (0x60FF = 32-bit displacement, 68020+ only) for an external
@@ -49,29 +72,29 @@ pub fn build(b: *std.Build) void {
     const startup_o = startup.addOutputFileArg("startup.o");
     startup.addFileArg(b.path("src/startup.s"));
 
-    // Stage 2: link object + trampoline -> relocatable ELF.
+    // Link object + trampoline -> relocatable ELF.
     const elf = b.addSystemCommand(&.{ "m68k-elf-ld", "--relocatable", "--gc-sections", "--script" });
     elf.addFileArg(b.path("prg.ld"));
     elf.addArg("-o");
-    const elf_out = elf.addOutputFileArg("HELLO.elf");
+    const elf_out = elf.addOutputFileArg(name ++ ".elf");
     elf.addFileArg(startup_o);
     elf.addFileArg(obj.getEmittedBin());
     elf.step.dependOn(&startup.step);
 
-    // Stage 3: ELF -> GEMDOS .PRG via toslink (output lands in the build cache).
+    // ELF -> GEMDOS .PRG via toslink.
     const toslink = b.addSystemCommand(&.{ "sh", "-c" });
     toslink.addArg("$HOME/Atari/bin/toslink -s -o \"$1\" \"$0\"");
     toslink.addFileArg(elf_out);
-    const prg = toslink.addOutputFileArg("HELLO.PRG");
+    const prg = toslink.addOutputFileArg(name ++ ".PRG");
     toslink.step.dependOn(&elf.step);
 
-    // Install the .PRG to ./zig-out/atari/HELLO.PRG.
-    const install_prg = b.addInstallFileWithDir(prg, .{ .custom = "atari" }, "HELLO.PRG");
+    // Install to ./zig-out/atari/<name>.PRG.
+    const install_prg = b.addInstallFileWithDir(prg, .{ .custom = "atari" }, name ++ ".PRG");
     b.getInstallStep().dependOn(&install_prg.step);
 
-    // Also copy it into the Hatari C: drive for testing.
+    // Copy into the Hatari C: drive for testing.
     const install_cd = b.addSystemCommand(&.{ "sh", "-c" });
-    install_cd.addArg("mkdir -p ~/Atari/CDrive/GEMZ && cp \"$0\" ~/Atari/CDrive/GEMZ/DEMO.PRG");
+    install_cd.addArg("mkdir -p ~/Atari/CDrive/GEMZ && cp \"$0\" ~/Atari/CDrive/GEMZ/" ++ name ++ ".PRG");
     install_cd.addFileArg(prg);
     b.getInstallStep().dependOn(&install_cd.step);
 }

@@ -40,6 +40,126 @@ const AesPb = extern struct {
     addr_out: [*]?[*]u8,
 };
 
+/// Input arrays for an AES call, passed to `aesCall` by pointer. Passing slices
+/// instead trips an m68k backend bug: a slice *length* carried in `d1` arrives
+/// as 0, so `int_in` gets nulled. Lengths read back from memory are safe.
+const AesArgs = extern struct {
+    int_in: ?[*]const i16,
+    n_int_in: u16,
+    addr_in: ?[*]const ?[*]const u8,
+    n_addr_in: u16,
+
+};
+
+/// AES opcodes (trap #2, d0 = $C8). Complete standard set.
+pub const AesOpcode = enum(u16) {
+    // appl_*
+    appl_init = 10,
+    appl_read = 11,
+    appl_write = 12,
+    appl_find = 13,
+    appl_tplay = 14,
+    appl_trecord = 15,
+    appl_bvset = 16,
+    appl_yield = 17,
+    appl_search = 18,
+    appl_exit = 19,
+
+    // evnt_*
+    evnt_keybd = 20,
+    evnt_button = 21,
+    evnt_mouse = 22,
+    evnt_mesag = 23,
+    evnt_timer = 24,
+    evnt_multi = 25,
+    evnt_dclick = 26,
+
+    // menu_*
+    menu_bar = 30,
+    menu_icheck = 31,
+    menu_ienable = 32,
+    menu_tnormal = 33,
+    menu_text = 34,
+    menu_register = 35,
+    menu_unregister = 36,
+
+    // objc_*
+    objc_add = 40,
+    objc_delete = 41,
+    objc_draw = 42,
+    objc_find = 43,
+    objc_offset = 44,
+    objc_order = 45,
+    objc_edit = 46,
+    objc_change = 47,
+
+    // form_*
+    form_do = 50,
+    form_dial = 51,
+    form_alert = 52,
+    form_error = 53,
+    form_center = 54,
+    form_keybd = 55,
+    form_button = 56,
+
+    // graf_*
+    graf_rubberbox = 70,
+    graf_dragbox = 71,
+    graf_movebox = 72,
+    graf_growbox = 73,
+    graf_shrinkbox = 74,
+    graf_watchbox = 75,
+    graf_slidebox = 76,
+    graf_handle = 77,
+    graf_mouse = 78,
+    graf_mkstate = 79,
+
+    // scrp_*
+    scrp_read = 80,
+    scrp_write = 81,
+    scrp_clear = 82,
+
+    // fsel_*
+    fsel_input = 90,
+
+    // wind_*
+    wind_create = 100,
+    wind_open = 101,
+    wind_close = 102,
+    wind_delete = 103,
+    wind_get = 104,
+    wind_set = 105,
+    wind_find = 106,
+    wind_update = 107,
+    wind_calc = 108,
+    wind_new = 109,
+
+    // rsrc_*
+    rsrc_load = 110,
+    rsrc_free = 111,
+    rsrc_gaddr = 112,
+    rsrc_saddr = 113,
+    rsrc_obfix = 114,
+
+    // shel_*
+    shel_read = 120,
+    shel_write = 121,
+    shel_get = 122,
+    shel_put = 123,
+    shel_find = 124,
+    shel_envrn = 125,
+    shel_rdef = 126,
+    shel_wdef = 127,
+
+    // xgrf_*
+    xgrf_stepcalc = 130,
+    xgrf_2box = 131,
+
+    // Unknown/extension opcode. Non-exhaustive so `@enumFromInt` of an
+    // unlisted value is well-defined rather than UB.
+    _,
+};
+
 /// The single AES global block. `appl_init` writes `app_id` here and it must
 /// persist for the whole application lifetime.
 var global: AesGlobal = .{
@@ -51,6 +171,10 @@ var global: AesGlobal = .{
     .reserved = .{0} ** 4,
 };
 
+/// The full 7-word output of the most recent AES call. Callers that need more
+/// than the return code (`wind_get`, `evnt_multi`) read this after `aesCall`.
+var aes_out: [7]i16 = .{ 0, 0, 0, 0, 0, 0, 0 };
+
 fn aesTrap(pb: *const AesPb) void {
     asm volatile (
         \\move.l %[pb], %%d1
@@ -58,32 +182,35 @@ fn aesTrap(pb: *const AesPb) void {
         \\trap #2
         :
         : [pb] "r" (pb),
-        : .{ .memory = true });
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true });
 }
 
-/// Dispatch one AES call. The caller supplies `int_out` (its length becomes
-/// `n_int_out`); `int_out[0]` is the implicit AES return code, declared output
-/// integers start at index 1. Returns `int_out[0]`.
-fn aesCall(opcode: u16, int_in: []const i16, addr_in: []const ?[*]const u8, int_out: []i16) i16 {
+/// Dispatch one AES call. `out[0]` is the implicit AES return code, declared
+/// output integers start at index 1; the full 7 words are left in `aes_out`.
+/// `n_int_out` is fixed at the AES maximum of 7; callers read only the words
+/// they declared.
+noinline fn aesCall(opcode: AesOpcode, args: *const AesArgs) i16 {
     var control = AesControl{
-        .opcode = opcode,
-        .n_int_in = @intCast(int_in.len),
-        .n_int_out = @intCast(int_out.len),
-        .n_addr_in = @intCast(addr_in.len),
+        .opcode = @intFromEnum(opcode),
+        .n_int_in = args.n_int_in,
+        .n_int_out = 7,
+        .n_addr_in = args.n_addr_in,
         .n_addr_out = 0,
     };
+    var int_out: [7]i16 = .{ 0, 0, 0, 0, 0, 0, 0 };
     var addr_out: [1]?[*]u8 = .{null};
 
     const pb = AesPb{
         .control = &control,
         .global = &global,
-        .int_in = if (int_in.len == 0) null else int_in.ptr,
-        .int_out = int_out.ptr,
-        .addr_in = if (addr_in.len == 0) null else addr_in.ptr,
+        .int_in = args.int_in,
+        .int_out = &int_out,
+        .addr_in = args.addr_in,
         .addr_out = &addr_out,
     };
 
     aesTrap(&pb);
+    aes_out = int_out;
     return int_out[0];
 }
 
@@ -97,6 +224,25 @@ fn pterm0() noreturn {
         \\trap #1
         ::: .{ .memory = true });
     unreachable;
+}
+
+/// GEMDOS Cconws (trap #1, function 9) — write a NUL-terminated string to the
+/// console. Visible on the host via Hatari `--conout 2`.
+fn cconws(s: [*:0]const u8) void {
+    asm volatile (
+        \\move.l %[s], -(%%sp)
+        \\move.w #9, -(%%sp)
+        \\trap #1
+        \\lea 6(%%sp), %%sp
+        :
+        : [s] "r" (s),
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true });
+}
+
+/// TEMP DEBUG: print a comptime message to the GEMDOS console.
+pub fn dbg(comptime msg: []const u8) void {
+    const s: [*:0]const u8 = msg ++ "\r\n";
+    cconws(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -116,13 +262,14 @@ pub const Point = extern struct {
 };
 
 /// `wind_create` attribute bits (kind).
-pub const WindKind = struct {
-    pub const name: i16 = 0x0001; // title bar
-    pub const closer: i16 = 0x0002; // close box
-    pub const fuller: i16 = 0x0004; // full box
-    pub const mover: i16 = 0x0008; // move bar
-    pub const info: i16 = 0x0010; // info line
-    pub const sizer: i16 = 0x0020; // size box
+pub const WindKind = packed struct(u16) {
+    name: bool = false, // bit 0 — title bar
+    closer: bool = false, // bit 1 — close box
+    fuller: bool = false, // bit 2 — full box
+    mover: bool = false, // bit 3 — move bar
+    info: bool = false, // bit 4 — info line
+    sizer: bool = false, // bit 5 — size box
+    _pad: u10 = 0,
 };
 
 /// `wind_set` / `wind_get` field selectors.
@@ -155,31 +302,91 @@ pub const ObjectType = enum(u16) {
     title = 31,
 };
 
-/// GEM object flags (`ob_flags`).
-pub const ObjectFlag = struct {
-    pub const selectable: u16 = 0x0001;
-    pub const default_: u16 = 0x0002;
-    pub const exit: u16 = 0x0004;
-    pub const editable: u16 = 0x0008;
-    pub const r_button: u16 = 0x0010;
-    pub const last_obj: u16 = 0x0020;
-    pub const touch_exit: u16 = 0x0040;
-    pub const hide_tree: u16 = 0x0080;
+/// GEM object flags (bitmask; combine with `ObjectFlag.flags`).
+pub const ObjectFlag = enum(u16) {
+    none = 0,
+    selectable = 0x0001,
+    default_ = 0x0002,
+    exit = 0x0004,
+    editable = 0x0008,
+    r_button = 0x0010,
+    last_obj = 0x0020,
+    touch_exit = 0x0040,
+    hide_tree = 0x0080,
+    _, // arbitrary bit combinations are valid
+
+    /// Build a combined flags value from a set of flags.
+    pub fn flags(set: []const ObjectFlag) ObjectFlag {
+        var result: u16 = 0;
+        for (set) |f| result |= @intFromEnum(f);
+        return @enumFromInt(result);
+    }
+};
+
+/// GEM text info (`TEDINFO`). `G_TEXT`, `G_BOXTEXT`, `G_FTEXT` and `G_FBOXTEXT`
+/// objects point at this instead of a raw string — EmuTOS dereferences it as a
+/// pointer-to-structure. `G_BUTTON` uses a plain string, not a TEDINFO.
+pub const TedInfo = extern struct {
+    ptext: ?[*]const u8, // ptr to text (must be first)
+    ptmplt: ?[*]const u8, // ptr to template
+    pvalid: ?[*]const u8, // ptr to validation chars
+    font: i16, // font id (3 = system font)
+    junk1: i16,
+    just: i16, // justification (0 = left)
+    color: i16, // text colour (1 = black)
+    junk2: i16,
+    thickness: i16, // border thickness
+    txtlen: i16, // text length
+    tmplen: i16, // template length
 };
 
 /// A GEM object-tree node (24 bytes, layout per Atari GEM).
 pub const Object = extern struct {
-    next: i16, // next sibling, -1 = none
-    head: i16, // first child, -1 = none
-    tail: i16, // last child, -1 = none
+    next: i16 = -1, // next sibling, -1 = none
+    head: i16 = -1, // first child, -1 = none
+    tail: i16 = -1, // last child, -1 = none
     object_type: ObjectType,
-    flags: u16,
-    state: u16,
-    spec: ?[*]const u8, // text label for text/button objects
-    x: i16,
-    y: i16,
-    w: i16,
-    h: i16,
+    flags: ObjectFlag = .none,
+    state: u16 = 0,
+    spec: ?[*]const u8 = null, // text label for text/button objects
+    x: i16 = 0,
+    y: i16 = 0,
+    w: i16 = 0,
+    h: i16 = 0,
+
+    /// A container box (typically the root of a subtree), at (0,0).
+    pub fn box(w: i16, h: i16) Object {
+        return .{ .object_type = .box, .w = w, .h = h };
+    }
+
+    /// A text object (G_TEXT). EmuTOS reads G_TEXT `ob_spec` as a `TEDINFO`
+    /// (pointer-to-structure whose `ptext` is the string), so pass a
+    /// `TedInfo` rather than a plain string.
+    pub fn text(spec: *const TedInfo, x: i16, y: i16, w: i16, h: i16) Object {
+        return .{ .object_type = .text, .spec = @ptrCast(spec), .x = x, .y = y, .w = w, .h = h };
+    }
+
+    /// A push button.
+    pub fn button(spec: [*:0]const u8, x: i16, y: i16, w: i16, h: i16, flags: ObjectFlag) Object {
+        return .{ .object_type = .button, .flags = flags, .spec = @ptrCast(spec), .x = x, .y = y, .w = w, .h = h };
+    }
+
+    /// Build a flat tree: node 0 is the root, nodes 1..N are its direct
+    /// children. Fills in the next/head/tail links automatically.
+    ///
+    /// Uses `inline for` so the copies/link writes unroll to fixed-index stores
+    /// at compile time — a runtime `for` here is miscompiled by the m68k
+    /// backend (indexed store loses its index register).
+    pub fn tree(comptime nodes: []const Object) [nodes.len]Object {
+        var result: [nodes.len]Object = undefined;
+        inline for (nodes, 0..) |node, i| result[i] = node;
+        if (nodes.len > 1) {
+            result[0].head = 1;
+            result[0].tail = @intCast(nodes.len - 1);
+            inline for (1..nodes.len - 1) |i| result[i].next = @intCast(i + 1);
+        }
+        return result;
+    }
 };
 
 /// Message types delivered through `evnt_multi`'s message buffer.
@@ -229,66 +436,75 @@ pub const AlertButton = enum(i16) {
 // AES: window management
 // ---------------------------------------------------------------------------
 
-fn windCreate(kind: i16, x: i16, y: i16, w: i16, h: i16) i16 {
-    const int_in = [_]i16{ kind, x, y, w, h };
-    var out: [1]i16 = undefined;
-    return aesCall(100, &int_in, &.{}, &out);
+noinline fn windCreate(kind: u16, x: i16, y: i16, w: i16, h: i16) i16 {
+    const int_in = [_]i16{ @bitCast(kind), x, y, w, h };
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    return aesCall(.wind_create, &args);
 }
 
-fn windOpen(id: i16, x: i16, y: i16, w: i16, h: i16) void {
+noinline fn windOpen(id: i16, x: i16, y: i16, w: i16, h: i16) void {
     const int_in = [_]i16{ id, x, y, w, h };
-    var out: [1]i16 = undefined;
-    _ = aesCall(101, &int_in, &.{}, &out);
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    _ = aesCall(.wind_open, &args);
 }
 
-fn windClose(id: i16) void {
+noinline fn windClose(id: i16) void {
     const int_in = [_]i16{id};
-    var out: [1]i16 = undefined;
-    _ = aesCall(102, &int_in, &.{}, &out);
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    _ = aesCall(.wind_close, &args);
 }
 
-fn windDelete(id: i16) void {
+noinline fn windDelete(id: i16) void {
     const int_in = [_]i16{id};
-    var out: [1]i16 = undefined;
-    _ = aesCall(103, &int_in, &.{}, &out);
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    _ = aesCall(.wind_delete, &args);
 }
 
-fn windSetTitle(id: i16, title: [*:0]const u8) void {
+noinline fn windSetTitle(id: i16, title: [*:0]const u8) void {
     const int_in = [_]i16{ id, WindField.name };
     const addr_in = [_]?[*]const u8{@ptrCast(title)};
-    var out: [1]i16 = undefined;
-    _ = aesCall(105, &int_in, &addr_in, &out);
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    _ = aesCall(.wind_set, &args);
 }
 
-fn windGet(id: i16, field: i16) Rect {
+noinline fn windSet(id: i16, field: i16, x: i16, y: i16, w: i16, h: i16) void {
+    const int_in = [_]i16{ id, field, x, y, w, h };
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    _ = aesCall(.wind_set, &args);
+}
+
+noinline fn windGet(id: i16, field: i16, out: *Rect) void {
     const int_in = [_]i16{ id, field };
-    var out: [5]i16 = undefined;
-    _ = aesCall(104, &int_in, &.{}, &out);
-    return .{ .x = out[1], .y = out[2], .w = out[3], .h = out[4] };
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    _ = aesCall(.wind_get, &args);
+    out.x = aes_out[1];
+    out.y = aes_out[2];
+    out.w = aes_out[3];
+    out.h = aes_out[4];
 }
 
-fn windUpdate(mode: i16) void {
+noinline fn windUpdate(mode: i16) void {
     const int_in = [_]i16{mode};
-    var out: [1]i16 = undefined;
-    _ = aesCall(107, &int_in, &.{}, &out);
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = null, .n_addr_in = 0 };
+    _ = aesCall(.wind_update, &args);
 }
 
 // ---------------------------------------------------------------------------
 // AES: object trees
 // ---------------------------------------------------------------------------
 
-fn objcDraw(tree: []Object, obj: i16, depth: i16, clip: Rect) void {
-    const int_in = [_]i16{ obj, depth, clip.x, clip.y, clip.w, clip.h };
+pub noinline fn objcDraw(tree: []Object, obj: i16, depth: i16, cx: i16, cy: i16, cw: i16, ch: i16) void {
+    const int_in = [_]i16{ obj, depth, cx, cy, cw, ch };
     const addr_in = [_]?[*]const u8{@ptrCast(tree.ptr)};
-    var out: [1]i16 = undefined;
-    _ = aesCall(42, &int_in, &addr_in, &out);
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    _ = aesCall(.objc_draw, &args);
 }
 
-fn objcFind(tree: []Object, obj: i16, depth: i16, mx: i16, my: i16) i16 {
+noinline fn objcFind(tree: []Object, obj: i16, depth: i16, mx: i16, my: i16) i16 {
     const int_in = [_]i16{ obj, depth, mx, my };
     const addr_in = [_]?[*]const u8{@ptrCast(tree.ptr)};
-    var out: [1]i16 = undefined;
-    return aesCall(43, &int_in, &addr_in, &out);
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    return aesCall(.objc_find, &args);
 }
 
 // ---------------------------------------------------------------------------
@@ -297,33 +513,34 @@ fn objcFind(tree: []Object, obj: i16, depth: i16, mx: i16, my: i16) i16 {
 
 /// Wait for a button click (left button) or a message, filling `message`
 /// (16 words) and `ev`. The `ev.mx`/`ev.my` are in *screen* coordinates.
-fn evntMulti(message: *[16]i16, ev: *Event) void {
+noinline fn evntMulti(message: *[16]i16, ev: *Event) void {
     const int_in = [_]i16{
         @bitCast(EventMask.button | EventMask.mesag), // events
         1, // bclicks
         1, // bmask (left button)
-        0, // bstate (released)
+        1, // bstate (pressed) — 0 (released) returns immediately when the
+           // button is already up, causing a busy loop
         0, 0, 0, 0, 0, // m1 (unused)
         0, 0, 0, 0, 0, // m2 (unused)
         0, 0, // timer
     };
     const addr_in = [_]?[*]const u8{@ptrCast(message)};
-    var out: [7]i16 = undefined;
-    _ = aesCall(25, &int_in, &addr_in, &out);
-    ev.ev = @bitCast(out[0]);
-    ev.mx = out[1];
-    ev.my = out[2];
-    ev.mb = out[3];
-    ev.ks = out[4];
-    ev.kc = out[5];
-    ev.mc = out[6];
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    _ = aesCall(.evnt_multi, &args);
+    ev.ev = @bitCast(aes_out[0]);
+    ev.mx = aes_out[1];
+    ev.my = aes_out[2];
+    ev.mb = aes_out[3];
+    ev.ks = aes_out[4];
+    ev.kc = aes_out[5];
+    ev.mc = aes_out[6];
 }
 
-fn grafMouse(mode: i16) void {
+noinline fn grafMouse(mode: i16) void {
     const int_in = [_]i16{mode};
     const addr_in = [_]?[*]const u8{null};
-    var out: [1]i16 = undefined;
-    _ = aesCall(78, &int_in, &addr_in, &out);
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    _ = aesCall(.graf_mouse, &args);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,9 +551,12 @@ fn grafMouse(mode: i16) void {
 pub const Window = struct {
     id: i16,
 
-    /// `wind_create` — create the window. Fails if the AES returns no handle.
-    pub fn create(kind: i16, x: i16, y: i16, w: i16, h: i16) !Window {
-        const id = windCreate(kind, x, y, w, h);
+    /// `wind_create` — create the window using the desktop work area as the
+    /// maximum constraint. Fails if the AES returns no handle.
+    pub fn create(kind: WindKind) !Window {
+        var desktop: Rect = undefined;
+        windGet(0, WindField.work_xywh, &desktop);
+        const id = windCreate(@bitCast(kind), desktop.x, desktop.y, desktop.w, desktop.h);
         if (id <= 0) return error.WindCreateFailed;
         return .{ .id = id };
     }
@@ -361,14 +581,34 @@ pub const Window = struct {
         windSetTitle(self.id, title);
     }
 
+    /// `wind_set` WF_CURRXYWH — move/resize the window.
+    pub fn moveTo(self: *const Window, x: i16, y: i16, w: i16, h: i16) void {
+        windSet(self.id, WindField.curr_xywh, x, y, w, h);
+    }
+
     /// Screen coordinates of the work-area origin (used to convert an
     /// `evnt_multi` screen coordinate into an object-tree coordinate).
+    /// EmuTOS returns `work_xywh` in screen coordinates already, so no
+    /// `curr_xywh` is added.
     pub fn workOrigin(self: *const Window) Point {
-        const curr = windGet(self.id, WindField.curr_xywh);
-        const work = windGet(self.id, WindField.work_xywh);
-        return .{ .x = curr.x + work.x, .y = curr.y + work.y };
+        var work: Rect = undefined;
+        windGet(self.id, WindField.work_xywh, &work);
+        return .{ .x = work.x, .y = work.y };
     }
 };
+
+/// Draw the tree into the window on WM_REDRAW. EmuTOS draws the tree at its
+/// root's `ob_x/ob_y` in *screen* coordinates (the objc_draw arguments are the
+/// clip, not an origin), so the root is placed at the window's work-area
+/// origin; its children stay window-relative.
+fn redrawTree(window: *const Window, tree: []Object, xc: i16, yc: i16, wc: i16, hc: i16) void {
+    const origin = window.workOrigin();
+    tree[0].x = origin.x;
+    tree[0].y = origin.y;
+    windUpdate(WindUpdate.beg_update);
+    objcDraw(tree, 0, 8, xc, yc, wc, hc);
+    windUpdate(WindUpdate.end_update);
+}
 
 // ---------------------------------------------------------------------------
 // Application session
@@ -381,16 +621,16 @@ pub const app = struct {
 
     /// `appl_init` — register the application with the AES.
     pub fn init() !app {
-        var out: [1]i16 = undefined;
-        const id = aesCall(10, &.{}, &.{}, &out);
+        const args = AesArgs{ .int_in = null, .n_int_in = 0, .addr_in = null, .n_addr_in = 0 };
+        const id = aesCall(.appl_init, &args);
         if (id == -1) return error.ApplInitFailed;
         return .{ .id = id };
     }
 
     /// `appl_exit` — release the application from the AES.
     pub fn exit(_: *const app) void {
-        var out: [1]i16 = undefined;
-        _ = aesCall(19, &.{}, &.{}, &out);
+        const args = AesArgs{ .int_in = null, .n_int_in = 0, .addr_in = null, .n_addr_in = 0 };
+        _ = aesCall(.appl_exit, &args);
     }
 
     /// `form_alert` — show a modal alert dialog.
@@ -403,8 +643,8 @@ pub const app = struct {
         const msg: [*:0]const u8 = "[1][" ++ text ++ "][ OK ]";
         const int_in = [_]i16{@intFromEnum(button)};
         const addr_in = [_]?[*]const u8{@ptrCast(msg)};
-        var out: [1]i16 = undefined;
-        _ = aesCall(52, &int_in, &addr_in, &out);
+        const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+        _ = aesCall(.form_alert, &args);
     }
 
     /// Run the modal event loop for a window.
@@ -422,17 +662,17 @@ pub const app = struct {
         var ev: Event = undefined;
         const depth: i16 = 8;
 
+        // `appl_init` leaves the app in the busy (hourglass) state; switch to
+        // the arrow cursor now that setup is done and we're about to yield.
+        grafMouse(GrafMouse.arrow);
+
         while (true) {
             evntMulti(&msg, &ev);
 
             if ((ev.ev & EventMask.mesag) != 0) {
                 switch (msg[0]) {
-                    MessageType.wm_redraw => {
-                        const clip = Rect{ .x = msg[4], .y = msg[5], .w = msg[6], .h = msg[7] };
-                        windUpdate(WindUpdate.beg_update);
-                        objcDraw(tree, 0, depth, clip);
-                        windUpdate(WindUpdate.end_update);
-                    },
+                    MessageType.wm_redraw => redrawTree(window, tree, msg[4], msg[5], msg[6], msg[7]),
+                    MessageType.wm_moved => window.moveTo(msg[4], msg[5], msg[6], msg[7]),
                     MessageType.wm_closed => return,
                     else => {},
                 }
@@ -445,16 +685,74 @@ pub const app = struct {
             }
         }
     }
+
+    /// Run a minimal modal event loop: redraws `tree` on WM_REDRAW, moves the
+    /// window on WM_MOVED, and returns on WM_CLOSED. No button handling or
+    /// click callback.
+    pub fn runBasic(_: *const app, window: *const Window, tree: []Object) void {
+        var msg: [16]i16 = undefined;
+        var ev: Event = undefined;
+
+        grafMouse(GrafMouse.arrow);
+
+        while (true) {
+            evntMulti(&msg, &ev);
+
+            if ((ev.ev & EventMask.mesag) != 0) {
+                switch (msg[0]) {
+                    MessageType.wm_redraw => redrawTree(window, tree, msg[4], msg[5], msg[6], msg[7]),
+                    MessageType.wm_moved => window.moveTo(msg[4], msg[5], msg[6], msg[7]),
+                    MessageType.wm_closed => return,
+                    else => {},
+                }
+            }
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
 // Runtime entry point — called from the user's `_start` shim.
 // ---------------------------------------------------------------------------
 
-/// Call the root module's `main()`, swallow any error, then exit cleanly.
+/// Show a simple alert box without an `app` instance (used for error reporting).
+pub fn alert(comptime text: []const u8) void {
+    const msg: [*:0]const u8 = "[1][" ++ text ++ "][ OK ]";
+    const int_in = [_]i16{1};
+    const addr_in = [_]?[*]const u8{@ptrCast(msg)};
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    _ = aesCall(.form_alert, &args);
+}
+
+/// Show a `[1][<name>][ OK ]` alert from a *runtime* string (e.g. an error
+/// name). Builds the bytes with an incrementing many-pointer rather than a
+/// slice, to avoid the m68k backend's indexed-store miscompile.
+pub fn alertName(name: []const u8) void {
+    var buf: [64]u8 = undefined;
+    var p: [*]u8 = &buf;
+    for ("[1]"[0..]) |c| {
+        p[0] = c;
+        p += 1;
+    }
+    for (name) |c| {
+        p[0] = c;
+        p += 1;
+    }
+    for ("][ OK ]"[0..]) |c| {
+        p[0] = c;
+        p += 1;
+    }
+    p[0] = 0;
+
+    const int_in = [_]i16{1};
+    const addr_in = [_]?[*]const u8{@ptrCast(&buf)};
+    const args = AesArgs{ .int_in = &int_in, .n_int_in = int_in.len, .addr_in = &addr_in, .n_addr_in = addr_in.len };
+    _ = aesCall(.form_alert, &args);
+}
+
+/// Call the root module's `main()`, report any error via an alert, then exit.
 pub fn start() callconv(.c) noreturn {
     const root = @import("root");
-    root.main() catch {};
+    root.main() catch |err| alertName(@errorName(err));
     pterm0();
 }
 

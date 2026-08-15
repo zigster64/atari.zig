@@ -73,7 +73,10 @@ fn linkToPrg(b: *std.Build, comptime name: []const u8, obj: *std.Build.Step.Comp
     startup.addFileArg(b.path("src/startup.s"));
 
     // Link object + trampoline -> relocatable ELF.
-    const elf = b.addSystemCommand(&.{ "m68k-elf-ld", "--relocatable", "--gc-sections", "--script" });
+    // `--gc-sections` is intentionally NOT used here: with `--relocatable` it
+    // can non-deterministically drop the app's .rodata (object trees, TEDINFO),
+    // which made G_TEXT objects vanish while G_BUTTON strings survived.
+    const elf = b.addSystemCommand(&.{ "m68k-elf-ld", "--relocatable", "--script" });
     elf.addFileArg(b.path("prg.ld"));
     elf.addArg("-o");
     const elf_out = elf.addOutputFileArg(name ++ ".elf");

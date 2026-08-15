@@ -291,6 +291,49 @@ Not window-relative. Do not add `curr_xywh` to it.
 EmuTOS dereferences `ob_spec` as a pointer-to-TEDINFO (first field `ptext` is the
 string). `G_BUTTON` and `G_TITLE` take plain strings.
 
-### ob_spec strings must be 2-aligned
-GEM word-accesses text strings; a byte-aligned .rodata literal at an odd address
-causes an address error. Use an `align(2)` buffer.
+### TEDINFO (not the text string) must be word-aligned
+For `G_TEXT`/`G_BOXTEXT`, `ob_spec` is a pointer to a `TEDINFO`; the AES reads
+that structure with word/long accesses, so the *TEDINFO* must be 2-aligned.
+Zig's `extern struct` already gives it the required alignment. The text string
+itself (`te_ptext`, and the plain string for `G_BUTTON`/`G_TITLE`) is read
+byte-by-byte and needs no special alignment — no `align(2)` buffer is required.
+
+`TEDINFO.te_color` is a packed bitfield, not a colour index: bits 8-11 select
+the text colour. `1` means "black *fill* colour", which gives white (invisible)
+text on the mono screen; black text is `0x0100`.
+
+### Object-tree invariant: the last child's `ob_next` points at its parent
+GEM links a parent's children in a sibling chain: `parent.ob_head` is the first
+child, `parent.ob_tail` is the last child, and each child's `ob_next` points to
+the next sibling — **except the last child, whose `ob_next` points back to the
+parent**.
+
+The AES relies on this to walk trees. `get_par()` (used by `objc_find` /
+`objc_offset`) does:
+
+    next = tree[obj].ob_next;
+    while (tree[next].ob_tail != obj)
+        next = tree[next].ob_next;
+
+If the last child's `ob_next` is left at `-1` (NIL) instead of the parent, that
+loop reads `tree[-1]` — one `OBJECT` before the array — and spins forever on
+garbage.
+
+**Symptom:** a window draws fine, but the very first click inside it hangs the
+app in a tight loop inside the AES (Hatari debugger shows the PC stuck in TOS
+`get_par`, ~`0xE7AA46` in the bundled EmuTOS). Buttons never get `onClick`.
+
+**Fix:** when building a flat tree, set the last child's `ob_next` to the root
+(`0`), e.g. `tree[last].next = 0`. `GEMZ.Object.tree()` now does this.
+
+### `evnt_multi` returns immediately when the requested button state is already current
+`evnt_multi`'s button wait is satisfied *immediately* if the mouse is already in
+the requested state (`downorup` checks `bstate == button`, not a transition):
+
+- `bstate = 0` ("released") returns at once while the button is up → busy loop
+  at idle.
+- `bstate = 1` ("pressed") returns at once while the button is held → busy loop
+  during the hold.
+
+To detect a click without spinning: wait for the press first (`bstate = 1`),
+then swallow the release with a second wait (`bstate = 0`).

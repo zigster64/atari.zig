@@ -343,16 +343,16 @@ pub const ObjectFlag = enum(u16) {
 /// pointer-to-structure. `G_BUTTON` uses a plain string, not a TEDINFO.
 pub const TedInfo = extern struct {
     ptext: ?[*]const u8, // ptr to text (must be first)
-    ptmplt: ?[*]const u8, // ptr to template
-    pvalid: ?[*]const u8, // ptr to validation chars
-    font: i16, // font id (3 = system font)
-    junk1: i16,
-    just: i16, // justification (0 = left)
-    color: i16, // text colour (1 = black)
-    junk2: i16,
-    thickness: i16, // border thickness
-    txtlen: i16, // text length
-    tmplen: i16, // template length
+    ptmplt: ?[*]const u8 = null,
+    pvalid: ?[*]const u8 = null,
+    font: i16 = 3,
+    junk1: i16 = 0,
+    just: i16 = 0,
+    color: i16 = 0x0100, // te_color bitfield: bits 8-11 = text colour (1 = black)
+    junk2: i16 = 0,
+    thickness: i16 = 1,
+    txtlen: i16 = 0,
+    tmplen: i16 = 0,
 };
 
 /// A GEM object-tree node (24 bytes, layout per Atari GEM).
@@ -374,16 +374,17 @@ pub const Object = extern struct {
         return .{ .object_type = .box, .w = w, .h = h };
     }
 
-    /// A text object (G_TEXT). EmuTOS reads G_TEXT `ob_spec` as a `TEDINFO`
-    /// (pointer-to-structure whose `ptext` is the string), so pass a
-    /// `TedInfo` rather than a plain string.
-    pub fn text(spec: *const TedInfo, x: i16, y: i16, w: i16, h: i16) Object {
-        return .{ .object_type = .text, .spec = @ptrCast(spec), .x = x, .y = y, .w = w, .h = h };
+    /// A text object (G_TEXT). Takes the text directly; a static, word-aligned
+    /// `TedInfo` pointing at it is created at comptime, so application code
+    /// never builds a string buffer or a TEDINFO by hand.
+    pub fn text(comptime s: []const u8, x: i16, y: i16, w: i16, h: i16) Object {
+        const ted = TedInfo{ .ptext = s.ptr };
+        return .{ .object_type = .text, .spec = @ptrCast(&ted), .x = x, .y = y, .w = w, .h = h };
     }
 
-    /// A push button.
-    pub fn button(spec: [*:0]const u8, x: i16, y: i16, w: i16, h: i16, flags: ObjectFlag) Object {
-        return .{ .object_type = .button, .flags = flags, .spec = @ptrCast(spec), .x = x, .y = y, .w = w, .h = h };
+    /// A push button. `ob_spec` points straight at the NUL-terminated string.
+    pub fn button(comptime s: []const u8, x: i16, y: i16, w: i16, h: i16, flags: ObjectFlag) Object {
+        return .{ .object_type = .button, .flags = flags, .spec = s.ptr, .x = x, .y = y, .w = w, .h = h };
     }
 
     /// Build a flat tree: node 0 is the root, nodes 1..N are its direct
@@ -399,6 +400,10 @@ pub const Object = extern struct {
             result[0].head = 1;
             result[0].tail = @intCast(nodes.len - 1);
             inline for (1..nodes.len - 1) |i| result[i].next = @intCast(i + 1);
+            // Standard GEM tree invariant: the last child's ob_next points
+            // back to its parent. Without this, AES ob_find/ob_offset walks
+            // ob_next into garbage (tree[-1]) and loops forever.
+            result[nodes.len - 1].next = 0;
         }
         return result;
     }
@@ -535,19 +540,27 @@ noinline fn objcFind(tree: []Object, obj: i16, depth: i16, mx: i16, my: i16) i16
 // AES: events and cursor
 // ---------------------------------------------------------------------------
 
-/// Wait for a button click (left button) or a message, filling `message`
-/// (16 words) and `ev`. The `ev.mx`/`ev.my` are in *screen* coordinates.
-noinline fn evntMulti(message: *[16]i16, ev: *Event) void {
+/// Wait for a left-button event and/or a message, filling `message` (16 words)
+/// and `ev`. `bstate` selects which button state ends the wait:
+///   - 1 = button *pressed*  (used to detect a fresh click)
+///   - 0 = button *released* (used to swallow the rest of a click)
+///
+/// The AES returns *immediately* when the requested state is already the
+/// current one, so a fixed `bstate` would spin: `bstate=0` spins while the
+/// button is up, `bstate=1` spins while it is held. Callers must therefore
+/// wait for the press first, then the release.
+noinline fn evntMulti(events: u16, bstate: i16, message: *[16]i16, ev: *Event) void {
     const int_in = [_]i16{
-        @bitCast(EventMask.button | EventMask.mesag), // events
-        1, // bclicks
-        1, // bmask (left button)
-        1, // bstate (pressed) — 0 (released) returns immediately when the
-           // button is already up, causing a busy loop
+        @bitCast(events),
+        1, // bclicks — a single click
+        1, // bmask — left button only
+        bstate,
         0, 0, 0, 0, 0, // m1 (unused)
         0, 0, 0, 0, 0, // m2 (unused)
         0, 0, // timer
     };
+    // evnt_multi always takes one addr_in (the 16-word message buffer), even
+    // when MU_MESAG is not part of `events`; it is simply left untouched.
     const addr_in = [_]?[*]const u8{@ptrCast(message)};
     const args = AesArgs.from(&int_in, &addr_in, 7);
     _ = aesCall(.evnt_multi, &args);
@@ -619,6 +632,14 @@ pub const Window = struct {
         windGet(self.id, WindField.work_xywh, &work);
         return .{ .x = work.x, .y = work.y };
     }
+
+    /// Full work-area rectangle in screen coordinates (EmuTOS returns
+    /// `work_xywh` in screen coords). Used as the redraw clip after a resize.
+    pub fn workRect(self: *const Window) Rect {
+        var work: Rect = undefined;
+        windGet(self.id, WindField.work_xywh, &work);
+        return work;
+    }
 };
 
 /// Draw the tree into the window on WM_REDRAW. EmuTOS draws the tree at its
@@ -632,6 +653,9 @@ fn redrawTree(window: *const Window, tree: []Object, xc: i16, yc: i16, wc: i16, 
     windUpdate(WindUpdate.beg_update);
     objcDraw(tree, 0, 8, xc, yc, wc, hc);
     windUpdate(WindUpdate.end_update);
+    // Restore the root so objc_find hit-tests in clean (0,0) tree coords.
+    tree[0].x = 0;
+    tree[0].y = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -680,7 +704,7 @@ pub const app = struct {
         self: *const app,
         window: *const Window,
         tree: []Object,
-        comptime onClick: fn (*const app, i16) bool,
+        comptime onClick: fn (*const app, i16, Object) bool,
     ) void {
         var msg: [16]i16 = undefined;
         var ev: Event = undefined;
@@ -691,12 +715,20 @@ pub const app = struct {
         grafMouse(GrafMouse.arrow);
 
         while (true) {
-            evntMulti(&msg, &ev);
+            evntMulti(EventMask.button | EventMask.mesag, 1, &msg, &ev);
 
             if ((ev.ev & EventMask.mesag) != 0) {
                 switch (msg[0]) {
                     MessageType.wm_redraw => redrawTree(window, tree, msg[4], msg[5], msg[6], msg[7]),
                     MessageType.wm_moved => window.moveTo(msg[4], msg[5], msg[6], msg[7]),
+                    MessageType.wm_sized => {
+                        const work = window.workRect();
+                        // Grow/shrink the root box to the new work area so the
+                        // background fills the resized window.
+                        tree[0].w = work.w;
+                        tree[0].h = work.h;
+                        redrawTree(window, tree, work.x, work.y, work.w, work.h);
+                    },
                     MessageType.wm_closed => return,
                     else => {},
                 }
@@ -705,29 +737,19 @@ pub const app = struct {
             if ((ev.ev & EventMask.button) != 0) {
                 const origin = window.workOrigin();
                 const obj = objcFind(tree, 0, depth, ev.mx - origin.x, ev.my - origin.y);
-                if (obj >= 0 and !onClick(self, obj)) return;
-            }
-        }
-    }
 
-    /// Run a minimal modal event loop: redraws `tree` on WM_REDRAW, moves the
-    /// window on WM_MOVED, and returns on WM_CLOSED. No button handling or
-    /// click callback.
-    pub fn runBasic(_: *const app, window: *const Window, tree: []Object) void {
-        var msg: [16]i16 = undefined;
-        var ev: Event = undefined;
+                // Swallow the button-up before dispatching. This keeps the next
+                // wait from spinning while the button is still held, and stops a
+                // modal dialog (form_alert) from misreading that release as its
+                // own click. Button-only wait, so queued messages are not eaten.
+                var release: Event = undefined;
+                evntMulti(EventMask.button, 0, &msg, &release);
 
-        grafMouse(GrafMouse.arrow);
-
-        while (true) {
-            evntMulti(&msg, &ev);
-
-            if ((ev.ev & EventMask.mesag) != 0) {
-                switch (msg[0]) {
-                    MessageType.wm_redraw => redrawTree(window, tree, msg[4], msg[5], msg[6], msg[7]),
-                    MessageType.wm_moved => window.moveTo(msg[4], msg[5], msg[6], msg[7]),
-                    MessageType.wm_closed => return,
-                    else => {},
+                if (obj >= 0 and obj < tree.len) {
+                    // DEEPSEEK - im assuming here that the value of obj == the index into tree []Object for the given object at
+                    // that location ?  If so then next line should work ??
+                    if (!onClick(self, obj, tree[@intCast(obj)])) return;
+                    // else continue on and process the next event
                 }
             }
         }
@@ -809,4 +831,15 @@ export fn memcpy(dest: [*]u8, src: [*]const u8, n: usize) [*]u8 {
     var i: usize = 0;
     while (i < n) : (i += 1) dest[i] = src[i];
     return dest;
+}
+
+pub fn hasPrefix(needle: [*]const u8, haystack: [*]const u8) bool {
+    var n_ptr = needle;
+    var h_ptr = haystack;
+    while (n_ptr[0] != 0) {
+        if (h_ptr[0] == 0 or n_ptr[0] != h_ptr[0]) return false;
+        n_ptr += 1;
+        h_ptr += 1;
+    }
+    return n_ptr[0] == 0;
 }

@@ -52,17 +52,35 @@ const AesArgs = extern struct {
 
     /// No inputs (appl_init, appl_exit).
     pub fn none() AesArgs {
-        return .{ .int_in = null, .n_int_in = 0, .addr_in = null, .n_addr_in = 0, .n_int_out = 1 };
+        return .{
+            .int_in = null,
+            .n_int_in = 0,
+            .addr_in = null,
+            .n_addr_in = 0,
+            .n_int_out = 1,
+        };
     }
 
     /// int_in only; explicit output count.
     pub fn ints(int_in: anytype, comptime out: u16) AesArgs {
-        return .{ .int_in = int_in, .n_int_in = @intCast(int_in.len), .addr_in = null, .n_addr_in = 0, .n_int_out = out };
+        return .{
+            .int_in = int_in,
+            .n_int_in = @intCast(int_in.len),
+            .addr_in = null,
+            .n_addr_in = 0,
+            .n_int_out = out,
+        };
     }
 
     /// int_in + addr_in; explicit output count.
     pub fn from(int_in: anytype, addr_in: anytype, comptime out: u16) AesArgs {
-        return .{ .int_in = int_in, .n_int_in = @intCast(int_in.len), .addr_in = addr_in, .n_addr_in = @intCast(addr_in.len), .n_int_out = out };
+        return .{
+            .int_in = int_in,
+            .n_int_in = @intCast(int_in.len),
+            .addr_in = addr_in,
+            .n_addr_in = @intCast(addr_in.len),
+            .n_int_out = out,
+        };
     }
 };
 
@@ -338,6 +356,27 @@ pub const ObjectFlag = enum(u16) {
     }
 };
 
+/// Standard Atari ST colour palette index (0-15). Bits 8-11 of a `te_color`
+/// word select one of these for the text colour. Indices 8-15 are the
+/// low-intensity versions of 0-7.
+pub const Color = enum(u16) {
+    white = 0,
+    black = 1,
+    red = 2,
+    green = 3,
+    blue = 4,
+    cyan = 5,
+    yellow = 6,
+    magenta = 7,
+    _,
+};
+
+/// Pack a palette index into a `te_color` word (text colour only; the
+/// border/fill nibbles stay 0).
+pub fn textColor(color: Color) i16 {
+    return @intCast(@as(u16, @intFromEnum(color)) << 8);
+}
+
 /// GEM text info (`TEDINFO`). `G_TEXT`, `G_BOXTEXT`, `G_FTEXT` and `G_FBOXTEXT`
 /// objects point at this instead of a raw string — EmuTOS dereferences it as a
 /// pointer-to-structure. `G_BUTTON` uses a plain string, not a TEDINFO.
@@ -353,7 +392,67 @@ pub const TedInfo = extern struct {
     thickness: i16 = 1,
     txtlen: i16 = 0,
     tmplen: i16 = 0,
+
+    /// Build a TEDINFO from a comptime string and a palette colour.
+    pub fn from(comptime text: []const u8, comptime color: Color) TedInfo {
+        return .{ .ptext = text.ptr, .color = textColor(color) };
+    }
 };
+
+/// GEM bit-block (`BITBLK`) — a 1-bit image. `G_IMAGE` objects point at this.
+pub const BitBlk = extern struct {
+    pdata: ?[*]const u8, // ptr to packed bit data (row-major, MSB-first)
+    wb: i16, // width in bytes
+    hl: i16, // height in lines (pixels)
+    x: i16, // source x offset (usually 0)
+    y: i16, // source y offset (usually 0)
+    color: i16, // foreground colour index
+
+    /// Build a BITBLK from a packed bitmap, using `color` for the "1" bits.
+    pub fn from(bmp: *const Bitmap, comptime color: Color) BitBlk {
+        return .{
+            .pdata = bmp.data.ptr,
+            .wb = @intCast((bmp.w_px + 7) / 8),
+            .hl = @intCast(bmp.h_px),
+            .x = 0,
+            .y = 0,
+            .color = textColor(color),
+        };
+    }
+};
+
+/// A packed 1-bit bitmap: row-major, MSB-first within each byte.
+pub const Bitmap = struct {
+    data: []const u8,
+    w_px: u16,
+    h_px: u16,
+};
+
+/// Pack ASCII art into a 1-bit bitmap at comptime. `#` (or `1`) = set,
+/// anything else = clear. All rows must be the same width.
+pub fn bitmap(comptime rows: []const []const u8) Bitmap {
+    @setEvalBranchQuota(10000);
+    const h: u16 = @intCast(rows.len);
+    const w: u16 = @intCast(rows[0].len);
+    const wb: usize = (@as(usize, w) + 7) / 8;
+    const data = blk: {
+        var buf: [wb * rows.len]u8 = undefined;
+        inline for (rows, 0..) |row, y| {
+            inline for (0..wb) |bi| {
+                var byte: u8 = 0;
+                inline for (0..8) |bit| {
+                    const px = bi * 8 + bit;
+                    if (px < w and row[px] == '#') {
+                        byte |= (@as(u8, 0x80) >> @intCast(bit));
+                    }
+                }
+                buf[y * wb + bi] = byte;
+            }
+        }
+        break :blk buf;
+    };
+    return .{ .data = data[0..], .w_px = w, .h_px = h };
+}
 
 /// A GEM object-tree node (24 bytes, layout per Atari GEM).
 pub const Object = extern struct {
@@ -380,6 +479,19 @@ pub const Object = extern struct {
     pub fn text(comptime s: []const u8, x: i16, y: i16, w: i16, h: i16) Object {
         const ted = TedInfo{ .ptext = s.ptr };
         return .{ .object_type = .text, .spec = @ptrCast(&ted), .x = x, .y = y, .w = w, .h = h };
+    }
+
+    /// A text object (G_TEXT) whose TEDINFO is supplied in full (colour, font,
+    /// justification, …). The TEDINFO must be a stable, word-aligned static —
+    /// pass `&some_module_level_const`, not a temporary.
+    pub fn textTed(ted: *const TedInfo, x: i16, y: i16, w: i16, h: i16) Object {
+        return .{ .object_type = .text, .spec = @ptrCast(ted), .x = x, .y = y, .w = w, .h = h };
+    }
+
+    /// A 1-bit bitmap image (G_IMAGE). `blk` must be a stable, word-aligned
+    /// static — pass `&some_module_level_const`, not a temporary.
+    pub fn image(blk: *const BitBlk, x: i16, y: i16, w: i16, h: i16) Object {
+        return .{ .object_type = .image, .spec = @ptrCast(blk), .x = x, .y = y, .w = w, .h = h };
     }
 
     /// A push button. `ob_spec` points straight at the NUL-terminated string.
@@ -682,6 +794,14 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
 
             pub fn text(comptime s: []const u8, x: i16, y: i16, w: i16, h: i16) Node {
                 return .{ .obj = Object.text(s, x, y, w, h) };
+            }
+
+            pub fn textTed(ted: *const TedInfo, x: i16, y: i16, w: i16, h: i16) Node {
+                return .{ .obj = Object.textTed(ted, x, y, w, h) };
+            }
+
+            pub fn image(blk: *const BitBlk, x: i16, y: i16, w: i16, h: i16) Node {
+                return .{ .obj = Object.image(blk, x, y, w, h) };
             }
 
             pub fn button(comptime s: []const u8, x: i16, y: i16, w: i16, h: i16, flags: ObjectFlag, bindings: []const Binding) Node {

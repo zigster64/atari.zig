@@ -2,6 +2,7 @@
 
 const gemz = @import("gemz");
 
+// Statically allocate the app with maxviews / max objects per view
 const MyApp = gemz.App(1, 8);
 
 export fn _start() callconv(.c) noreturn {

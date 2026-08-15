@@ -386,27 +386,6 @@ pub const Object = extern struct {
     pub fn button(comptime s: []const u8, x: i16, y: i16, w: i16, h: i16, flags: ObjectFlag) Object {
         return .{ .object_type = .button, .flags = flags, .spec = s.ptr, .x = x, .y = y, .w = w, .h = h };
     }
-
-    /// Build a flat tree: node 0 is the root, nodes 1..N are its direct
-    /// children. Fills in the next/head/tail links automatically.
-    ///
-    /// Uses `inline for` so the copies/link writes unroll to fixed-index stores
-    /// at compile time — a runtime `for` here is miscompiled by the m68k
-    /// backend (indexed store loses its index register).
-    pub fn tree(comptime nodes: []const Object) [nodes.len]Object {
-        var result: [nodes.len]Object = undefined;
-        inline for (nodes, 0..) |node, i| result[i] = node;
-        if (nodes.len > 1) {
-            result[0].head = 1;
-            result[0].tail = @intCast(nodes.len - 1);
-            inline for (1..nodes.len - 1) |i| result[i].next = @intCast(i + 1);
-            // Standard GEM tree invariant: the last child's ob_next points
-            // back to its parent. Without this, AES ob_find/ob_offset walks
-            // ob_next into garbage (tree[-1]) and loops forever.
-            result[nodes.len - 1].next = 0;
-        }
-        return result;
-    }
 };
 
 /// Message types delivered through `evnt_multi`'s message buffer.
@@ -512,6 +491,12 @@ noinline fn windGet(id: i16, field: i16, out: *Rect) void {
     out.h = aes_out[4];
 }
 
+noinline fn windFind(x: i16, y: i16) i16 {
+    const int_in = [_]i16{ x, y };
+    const args = AesArgs.ints(&int_in, 1);
+    return aesCall(.wind_find, &args);
+}
+
 noinline fn windUpdate(mode: i16) void {
     const int_in = [_]i16{mode};
     const args = AesArgs.ints(&int_in, 1);
@@ -614,7 +599,7 @@ pub const Window = struct {
     }
 
     /// `wind_set` WF_NAME — set the title bar text.
-    pub fn setTitle(self: *const Window, comptime title: [*:0]const u8) void {
+    pub fn setTitle(self: *const Window, title: [*:0]const u8) void {
         windSetTitle(self.id, title);
     }
 
@@ -662,99 +647,235 @@ fn redrawTree(window: *const Window, tree: []Object, xc: i16, yc: i16, wc: i16, 
 // Application session
 // ---------------------------------------------------------------------------
 
-/// An AES application session.
-pub const app = struct {
-    /// The application id assigned by `appl_init`.
-    id: i16,
+/// An AES application session, parameterised by static widget capacity.
+///
+/// `max_views` is how many windows may be open at once and `max_nodes` is how
+/// many GEM objects any single window's tree may contain. Both are comptime so
+/// the whole thing stays heap-free.
+pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
+    return struct {
+        const Self = @This();
 
-    /// `appl_init` — register the application with the AES.
-    pub fn init() !app {
-        const args = AesArgs.none();
-        const id = aesCall(.appl_init, &args);
-        if (id == -1) return error.ApplInitFailed;
-        return .{ .id = id };
-    }
+        /// Object-tree event kinds a widget can be bound to.
+        pub const EventType = enum {
+            click,
+            select,
+            edit,
+        };
 
-    /// `appl_exit` — release the application from the AES.
-    pub fn exit(_: *const app) void {
-        const args = AesArgs.none();
-        _ = aesCall(.appl_exit, &args);
-    }
+        /// A static event→handler binding for one widget. Add a variant here to
+        /// extend the event set (and a matching `switch` arm in `run`).
+        pub const Binding = union(EventType) {
+            click: *const fn (*Self) bool,
+            select: *const fn (*Self, bool) bool,
+            edit: *const fn (*Self, i16) bool,
+        };
 
-    /// `form_alert` — show a modal alert dialog.
-    ///
-    /// `text` is plain message text; it is wrapped into the GEM alert format
-    /// `"[1][<text>][ OK ]"` (icon 1 = note, one "OK" button). The full string
-    /// is built at comptime (like `hello/`) — runtime byte stores trip an m68k
-    /// backend codegen bug where indexed stores lose their index register.
-    pub fn form_alert(_: *const app, button: AlertButton, comptime text: []const u8) void {
-        const msg: [*:0]const u8 = "[1][" ++ text ++ "][ OK ]";
-        const int_in = [_]i16{@intFromEnum(button)};
-        const addr_in = [_]?[*]const u8{@ptrCast(msg)};
-        const args = AesArgs.from(&int_in, &addr_in, 1);
-        _ = aesCall(.form_alert, &args);
-    }
+        /// A tree node: a GEM object plus its static event bindings.
+        pub const Node = struct {
+            obj: Object,
+            bindings: []const Binding = &[_]Binding{},
 
-    /// Run the modal event loop for a window.
-    ///
-    /// Redraws `tree` on WM_REDRAW, returns on WM_CLOSED, and dispatches
-    /// button clicks to `onClick` (passing this app); `onClick` returns false
-    /// to stop the loop (e.g. a "Close" button).
-    pub fn run(
-        self: *const app,
-        window: *const Window,
-        tree: []Object,
-        comptime onClick: fn (*const app, i16, Object) bool,
-    ) void {
-        var msg: [16]i16 = undefined;
-        var ev: Event = undefined;
-        const depth: i16 = 8;
+            pub fn box(w: i16, h: i16) Node {
+                return .{ .obj = Object.box(w, h) };
+            }
 
-        // `appl_init` leaves the app in the busy (hourglass) state; switch to
-        // the arrow cursor now that setup is done and we're about to yield.
-        grafMouse(GrafMouse.arrow);
+            pub fn text(comptime s: []const u8, x: i16, y: i16, w: i16, h: i16) Node {
+                return .{ .obj = Object.text(s, x, y, w, h) };
+            }
 
-        while (true) {
-            evntMulti(EventMask.button | EventMask.mesag, 1, &msg, &ev);
+            pub fn button(comptime s: []const u8, x: i16, y: i16, w: i16, h: i16, flags: ObjectFlag, bindings: []const Binding) Node {
+                return .{ .obj = Object.button(s, x, y, w, h, flags), .bindings = bindings };
+            }
+        };
 
-            if ((ev.ev & EventMask.mesag) != 0) {
-                switch (msg[0]) {
-                    MessageType.wm_redraw => redrawTree(window, tree, msg[4], msg[5], msg[6], msg[7]),
-                    MessageType.wm_moved => window.moveTo(msg[4], msg[5], msg[6], msg[7]),
-                    MessageType.wm_sized => {
-                        const work = window.workRect();
-                        // Grow/shrink the root box to the new work area so the
-                        // background fills the resized window.
-                        tree[0].w = work.w;
-                        tree[0].h = work.h;
-                        redrawTree(window, tree, work.x, work.y, work.w, work.h);
+        /// Description of a window to create in `open`.
+        pub const WindowSpec = struct {
+            kind: WindKind,
+            title: [*:0]const u8,
+            x: i16,
+            y: i16,
+            w: i16,
+            h: i16,
+        };
+
+        /// One open window: its AES handle, its own mutable tree copy, and its
+        /// static bindings (indexed the same as the tree).
+        const View = struct {
+            window: Window,
+            node_count: usize,
+            tree: [max_nodes]Object,
+            bindings: [max_nodes][]const Binding,
+
+            fn treeSlice(self: *View) []Object {
+                return self.tree[0..self.node_count];
+            }
+        };
+
+        id: i16,
+        views: [max_views]View,
+        view_count: usize,
+
+        /// `appl_init` — register the application with the AES.
+        pub fn init() !Self {
+            const args = AesArgs.none();
+            const id = aesCall(.appl_init, &args);
+            if (id == -1) return error.ApplInitFailed;
+            return .{ .id = id, .views = undefined, .view_count = 0 };
+        }
+
+        /// `appl_exit` — release the application from the AES.
+        pub fn exit(_: *Self) void {
+            const args = AesArgs.none();
+            _ = aesCall(.appl_exit, &args);
+        }
+
+        /// `form_alert` — show a modal alert dialog.
+        pub fn form_alert(_: *const Self, button: AlertButton, comptime text: []const u8) void {
+            const msg: [*:0]const u8 = "[1][" ++ text ++ "][ OK ]";
+            const int_in = [_]i16{@intFromEnum(button)};
+            const addr_in = [_]?[*]const u8{@ptrCast(msg)};
+            const args = AesArgs.from(&int_in, &addr_in, 1);
+            _ = aesCall(.form_alert, &args);
+        }
+
+        /// Create + open a window and register it (and its tree + bindings).
+        pub fn open(self: *Self, spec: WindowSpec, comptime nodes: []const Node) !void {
+            if (self.view_count >= max_views) return error.TooManyViews;
+            if (nodes.len > max_nodes) return error.TooManyNodes;
+
+            const built = buildTree(nodes);
+
+            const win = try Window.create(spec.kind);
+            win.setTitle(spec.title);
+            win.open(spec.x, spec.y, spec.w, spec.h);
+
+            const slot = self.view_count;
+            const view = &self.views[slot];
+            view.window = win;
+            view.node_count = nodes.len;
+            inline for (0..nodes.len) |i| {
+                view.tree[i] = built.objects[i];
+                view.bindings[i] = built.bindings[i];
+            }
+            self.view_count += 1;
+        }
+
+        /// Run the event loop until the last window is closed.
+        pub fn run(self: *Self) void {
+            var msg: [16]i16 = undefined;
+            var ev: Event = undefined;
+
+            // `appl_init` leaves the app in the busy (hourglass) state.
+            grafMouse(GrafMouse.arrow);
+
+            while (true) {
+                if (self.view_count == 0) return;
+
+                evntMulti(EventMask.button | EventMask.mesag, 1, &msg, &ev);
+
+                if ((ev.ev & EventMask.mesag) != 0) self.handleMessage(&msg);
+                if ((ev.ev & EventMask.button) != 0) self.handleClick(ev.mx, ev.my);
+            }
+        }
+
+        /// Build the linked GEM tree plus a parallel binding array from `nodes`.
+        fn buildTree(comptime nodes: []const Node) struct {
+            objects: [nodes.len]Object,
+            bindings: [nodes.len][]const Binding,
+        } {
+            var objects: [nodes.len]Object = undefined;
+            var bindings: [nodes.len][]const Binding = undefined;
+            inline for (nodes, 0..) |node, i| {
+                objects[i] = node.obj;
+                bindings[i] = node.bindings;
+            }
+            if (nodes.len > 1) {
+                objects[0].head = 1;
+                objects[0].tail = @intCast(nodes.len - 1);
+                inline for (1..nodes.len - 1) |i| objects[i].next = @intCast(i + 1);
+                // GEM invariant: the last child's ob_next points at its parent.
+                objects[nodes.len - 1].next = 0;
+            }
+            return .{ .objects = objects, .bindings = bindings };
+        }
+
+        fn findViewIndex(self: *Self, handle: i16) ?usize {
+            var i: usize = 0;
+            while (i < self.view_count) : (i += 1) {
+                if (self.views[i].window.id == handle) return i;
+            }
+            return null;
+        }
+
+        fn findView(self: *Self, handle: i16) ?*View {
+            const idx = self.findViewIndex(handle) orelse return null;
+            return &self.views[idx];
+        }
+
+        fn closeView(self: *Self, handle: i16) void {
+            const idx = self.findViewIndex(handle) orelse return;
+            self.views[idx].window.close();
+            self.views[idx].window.delete();
+            self.view_count -= 1;
+            if (idx != self.view_count) {
+                self.views[idx] = self.views[self.view_count];
+            }
+        }
+
+        fn handleMessage(self: *Self, msg: *const [16]i16) void {
+            switch (msg[0]) {
+                MessageType.wm_redraw => {
+                    const v = self.findView(msg[3]) orelse return;
+                    redrawTree(&v.window, v.treeSlice(), msg[4], msg[5], msg[6], msg[7]);
+                },
+                MessageType.wm_moved => {
+                    const v = self.findView(msg[3]) orelse return;
+                    v.window.moveTo(msg[4], msg[5], msg[6], msg[7]);
+                },
+                MessageType.wm_sized => {
+                    const v = self.findView(msg[3]) orelse return;
+                    const work = v.window.workRect();
+                    v.tree[0].w = work.w;
+                    v.tree[0].h = work.h;
+                    redrawTree(&v.window, v.treeSlice(), work.x, work.y, work.w, work.h);
+                },
+                MessageType.wm_closed => self.closeView(msg[3]),
+                else => {},
+            }
+        }
+
+        fn handleClick(self: *Self, mx: i16, my: i16) void {
+            const handle = windFind(mx, my);
+            const v = self.findView(handle) orelse return;
+
+            // Swallow the button-up before dispatching so the next wait doesn't
+            // spin and a modal dialog doesn't misread the release as its own.
+            var release: Event = undefined;
+            var msg: [16]i16 = undefined;
+            evntMulti(EventMask.button, 0, &msg, &release);
+
+            const origin = v.window.workOrigin();
+            const obj = objcFind(v.treeSlice(), 0, 8, mx - origin.x, my - origin.y);
+            if (obj < 0) return;
+            const idx: usize = @intCast(obj);
+            if (idx >= v.node_count) return;
+
+            const bindings = v.bindings[idx];
+            for (bindings) |b| {
+                switch (b) {
+                    .click => |h| {
+                        if (!h(self)) {
+                            self.closeView(handle);
+                            return;
+                        }
                     },
-                    MessageType.wm_closed => return,
                     else => {},
                 }
             }
-
-            if ((ev.ev & EventMask.button) != 0) {
-                const origin = window.workOrigin();
-                const obj = objcFind(tree, 0, depth, ev.mx - origin.x, ev.my - origin.y);
-
-                // Swallow the button-up before dispatching. This keeps the next
-                // wait from spinning while the button is still held, and stops a
-                // modal dialog (form_alert) from misreading that release as its
-                // own click. Button-only wait, so queued messages are not eaten.
-                var release: Event = undefined;
-                evntMulti(EventMask.button, 0, &msg, &release);
-
-                if (obj >= 0 and obj < tree.len) {
-                    // DEEPSEEK - im assuming here that the value of obj == the index into tree []Object for the given object at
-                    // that location ?  If so then next line should work ??
-                    if (!onClick(self, obj, tree[@intCast(obj)])) return;
-                    // else continue on and process the next event
-                }
-            }
         }
-    }
-};
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Runtime entry point — called from the user's `_start` shim.
@@ -833,13 +954,18 @@ export fn memcpy(dest: [*]u8, src: [*]const u8, n: usize) [*]u8 {
     return dest;
 }
 
-pub fn hasPrefix(needle: [*]const u8, haystack: [*]const u8) bool {
-    var n_ptr = needle;
-    var h_ptr = haystack;
-    while (n_ptr[0] != 0) {
-        if (h_ptr[0] == 0 or n_ptr[0] != h_ptr[0]) return false;
-        n_ptr += 1;
-        h_ptr += 1;
+/// LLVM lowers potentially-overlapping struct moves (e.g. swap-removing a view)
+/// to `memmove`; provide our own 68000-safe one.
+export fn memmove(dest: [*]u8, src: [*]const u8, n: usize) [*]u8 {
+    var i: usize = 0;
+    if (@intFromPtr(dest) < @intFromPtr(src)) {
+        while (i < n) : (i += 1) dest[i] = src[i];
+    } else {
+        i = n;
+        while (i > 0) {
+            i -= 1;
+            dest[i] = src[i];
+        }
     }
-    return n_ptr[0] == 0;
+    return dest;
 }

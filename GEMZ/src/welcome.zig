@@ -2,12 +2,14 @@
 
 const gemz = @import("gemz");
 
+const MyApp = gemz.App(1, 8);
+
 export fn _start() callconv(.c) noreturn {
     gemz.start();
 }
 
 pub fn main() !void {
-    const app = try gemz.app.init();
+    var app = try MyApp.init();
     defer app.exit();
     app.form_alert(.default_button, "All your base|are belong to|Zig m68k");
 }

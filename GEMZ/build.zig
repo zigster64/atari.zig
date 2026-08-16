@@ -42,8 +42,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const daf = b.createModule(.{
+        .root_source_file = b.path("src/daf.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .imports = &.{
+            .{ .name = "gemz", .module = gemz },
+        },
+    });
+
     linkToPrg(b, "HELLO", compileObject(b, "HELLO", welcome));
     linkToPrg(b, "WINDOW", compileObject(b, "WINDOW", window));
+    linkToPrg(b, "DAF", compileObject(b, "DAF", daf));
 }
 
 /// Compile a module to a relocatable m68k ELF object with `_start` as the

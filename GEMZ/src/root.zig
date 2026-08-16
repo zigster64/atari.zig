@@ -377,6 +377,14 @@ pub fn textColor(color: Color) i16 {
     return @intCast(@as(u16, @intFromEnum(color)) << 8);
 }
 
+/// Pack a palette colour into a G_BOX fill word. G_BOX stores its fill spec
+/// directly in `ob_spec` (the low word): bits 0-3 = fill colour, bits 4-6 =
+/// inside pattern (1 = solid), bits 12-15 = border colour.
+fn boxFill(color: Color) u16 {
+    const c: u16 = @intFromEnum(color) & 0xF;
+    return c | (@as(u16, 1) << 4) | (c << 12);
+}
+
 /// GEM text info (`TEDINFO`). `G_TEXT`, `G_BOXTEXT`, `G_FTEXT` and `G_FBOXTEXT`
 /// objects point at this instead of a raw string — EmuTOS dereferences it as a
 /// pointer-to-structure. `G_BUTTON` uses a plain string, not a TEDINFO.
@@ -431,7 +439,7 @@ pub const Bitmap = struct {
 /// Pack ASCII art into a 1-bit bitmap at comptime. `#` (or `1`) = set,
 /// anything else = clear. All rows must be the same width.
 pub fn bitmap(comptime rows: []const []const u8) Bitmap {
-    @setEvalBranchQuota(10000);
+    @setEvalBranchQuota(400000);
     const h: u16 = @intCast(rows.len);
     const w: u16 = @intCast(rows[0].len);
     const wb: usize = (@as(usize, w) + 7) / 8;
@@ -471,6 +479,12 @@ pub const Object = extern struct {
     /// A container box (typically the root of a subtree), at (0,0).
     pub fn box(w: i16, h: i16) Object {
         return .{ .object_type = .box, .w = w, .h = h };
+    }
+
+    /// A solid-filled box (typically a background), at (0,0).
+    pub fn filledBox(w: i16, h: i16, color: Color) Object {
+        const spec: [*]const u8 = @ptrFromInt(@as(usize, boxFill(color)));
+        return .{ .object_type = .box, .spec = spec, .w = w, .h = h };
     }
 
     /// A text object (G_TEXT). Takes the text directly; a static, word-aligned
@@ -792,6 +806,10 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
                 return .{ .obj = Object.box(w, h) };
             }
 
+            pub fn filledBox(w: i16, h: i16, color: Color) Node {
+                return .{ .obj = Object.filledBox(w, h, color) };
+            }
+
             pub fn text(comptime s: []const u8, x: i16, y: i16, w: i16, h: i16) Node {
                 return .{ .obj = Object.text(s, x, y, w, h) };
             }
@@ -920,41 +938,51 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             return .{ .objects = objects, .bindings = bindings };
         }
 
-        fn findViewIndex(self: *Self, handle: i16) ?usize {
+        fn findView(self: *Self, handle: i16, out: **View) bool {
             var i: usize = 0;
             while (i < self.view_count) : (i += 1) {
-                if (self.views[i].window.id == handle) return i;
+                if (self.views[i].window.id == handle) {
+                    out.* = &self.views[i];
+                    return true;
+                }
             }
-            return null;
-        }
-
-        fn findView(self: *Self, handle: i16) ?*View {
-            const idx = self.findViewIndex(handle) orelse return null;
-            return &self.views[idx];
+            return false;
         }
 
         fn closeView(self: *Self, handle: i16) void {
-            const idx = self.findViewIndex(handle) orelse return;
-            self.views[idx].window.close();
-            self.views[idx].window.delete();
-            self.view_count -= 1;
-            if (idx != self.view_count) {
-                self.views[idx] = self.views[self.view_count];
+            var i: usize = 0;
+            while (i < self.view_count) : (i += 1) {
+                if (self.views[i].window.id != handle) continue;
+                self.views[i].window.close();
+                self.views[i].window.delete();
+                self.view_count -= 1;
+                if (i != self.view_count) {
+                    self.views[i] = self.views[self.view_count];
+                }
+                return;
             }
         }
 
         fn handleMessage(self: *Self, msg: *const [16]i16) void {
             switch (msg[0]) {
                 MessageType.wm_redraw => {
-                    const v = self.findView(msg[3]) orelse return;
+                    var v: *View = undefined;
+                    if (!self.findView(msg[3], &v)) return;
                     redrawTree(&v.window, v.treeSlice(), msg[4], msg[5], msg[6], msg[7]);
                 },
                 MessageType.wm_moved => {
-                    const v = self.findView(msg[3]) orelse return;
+                    var v: *View = undefined;
+                    if (!self.findView(msg[3], &v)) return;
                     v.window.moveTo(msg[4], msg[5], msg[6], msg[7]);
                 },
                 MessageType.wm_sized => {
-                    const v = self.findView(msg[3]) orelse return;
+                    var v: *View = undefined;
+                    if (!self.findView(msg[3], &v)) return;
+                    // TODO(tech-debt): never commits the resize — must call
+                    // `v.window.moveTo(msg[4], msg[5], msg[6], msg[7])`
+                    // (wind_set WF_CURRXYWH) BEFORE re-reading workRect(), else
+                    // the AES rubber-band snaps back and the window keeps its
+                    // old size.
                     const work = v.window.workRect();
                     v.tree[0].w = work.w;
                     v.tree[0].h = work.h;
@@ -967,7 +995,8 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
 
         fn handleClick(self: *Self, mx: i16, my: i16) void {
             const handle = windFind(mx, my);
-            const v = self.findView(handle) orelse return;
+            var v: *View = undefined;
+            if (!self.findView(handle, &v)) return;
 
             // Swallow the button-up before dispatching so the next wait doesn't
             // spin and a modal dialog doesn't misread the release as its own.

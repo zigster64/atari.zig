@@ -337,3 +337,112 @@ the requested state (`downorup` checks `bstate == button`, not a transition):
 
 To detect a click without spinning: wait for the press first (`bstate = 1`),
 then swallow the release with a second wait (`bstate = 0`).
+
+### `te_color` colour indices (Atari ST palette)
+`te_color` packs the *text* colour into bits 8–11 (border 12–15, fill 0–3,
+replace-mode bit 7). The standard palette indices are 0 white, 1 black, 2 red,
+3 green, 4 blue, 5 cyan, 6 yellow, 7 magenta (8–15 are the low-intensity set).
+So red text is `0x0200`. GEMZ wraps this as `Color` (enum) + `textColor(color)`
+(`Color.red` → `0x0200`).
+
+### G_IMAGE / BITBLK — 1-bit images
+`G_IMAGE` (object type 23) draws a monochrome bitmap; `ob_spec` points at a
+`BITBLK`:
+
+    void *bi_pdata;   // packed bit data (row-major, MSB-first)
+    WORD  bi_wb;      // width in bytes
+    WORD  bi_hl;      // height in lines
+    WORD  bi_x;       // source x offset (usually 0)
+    WORD  bi_y;       // source y offset (usually 0)
+    WORD  bi_color;   // foreground colour index
+
+"1" bits draw in `bi_color`; "0" bits are transparent. Pack 8 pixels per byte,
+MSB = leftmost pixel. The BITBLK (and its data) must be a stable, word-aligned
+static — pass `&module_level_const`, never a temporary.
+
+### Comptime ASCII-art → bitmap
+`gemz.bitmap(&.{ "..#..", ... })` packs `#`-and-`.` rows into a 1-bit bitmap at
+compile time, so the app never hand-writes bytes and no runtime packing code is
+emitted. The ASCII source does **not** appear in the binary — only the packed
+bytes (48×24 → 144 bytes). The triple-nested `inline for` exceeds the comptime
+evaluator's default 1000-branch quota, so the helper calls
+`@setEvalBranchQuota(10000)`.
+
+### LLVM lowers struct moves to `memmove`
+Swap-removing a pool entry (`views[i] = views[last]`) copies a whole struct; LLVM
+emits `memmove` for potentially-overlapping copies. Freestanding m68k must
+provide `memmove` (forward/backward byte loop) next to `memcpy`/`memset`.
+
+## GEMZ application model (App / Node / View)
+
+`gemz.App(comptime max_views, comptime max_nodes)` is a comptime function that
+returns the app *type*, sized for heap-free static allocation:
+
+- `max_views` — windows open at once.
+- `max_nodes` — largest single tree (**per view**, not global).
+
+A live window is a `View`: its own mutable copy of the tree (redraw/resize
+mutate `tree[0]`), plus a parallel binding array. Footprint ≈
+`max_views × (6 + 32 × max_nodes)` bytes — declare the app as a module-level
+global if you size it large, since a `var` in `main()` is on the stack.
+
+Behaviour is bound at the widget, not by tree index (reordering can't desync):
+
+    const MyApp = gemz.App(1, 16);
+    var app = try MyApp.init();
+    defer app.exit();
+
+    try app.open(.{ .kind = .{ .name = true, .closer = true, .mover = true, .sizer = true },
+                    .title = "WINDOW", .x = 50, .y = 50, .w = 320, .h = 200 }, &.{
+        .box(320, 200),
+        .text("banner", 8, 8, 300, 20),
+        .textTed(&RED, 8, 32, 300, 20),
+        .image(&LOGO, 8, 60, 48, 24),
+        .button(" Alert ", 8, 140, 80, 24, .selectable, &.{.{ .click = alertClicked }}),
+    });
+
+    app.run();
+
+`Node = { obj, bindings }`. `bindings` is `[]const Binding`, a tagged union
+(`click`, `select`, `edit` — only `click` dispatched today). `buildTree()` splits
+the `Node` list into the linked GEM tree + the handler array in one place, so the
+two can't drift.
+
+`run()` re-reads `views[0..view_count]` every pass: handlers can `app.open(...)`
+mid-run, `WM_CLOSED` swap-removes a view, and the loop exits when the pool
+empties. Messages route by `msg[3]`, clicks by `wind_find`.
+
+## Tech Debt
+
+### Window resize never commits (`WM_SIZED`)
+
+**Symptom:** dragging the sizer corner shows the AES rubber-band rect, but on
+release the window snaps back — it never actually resizes. Pre-existing, not a
+regression.
+
+**Cause:** the `WM_SIZED` arm in `handleMessage` resizes `tree[0]` and redraws,
+but never tells the AES the new size. A resize is only applied when the app
+calls `wind_set(handle, WF_CURRXYWH, x, y, w, h)`; the handler skips it.
+
+**Fix:** call `v.window.moveTo(msg[4], msg[5], msg[6], msg[7])` (already wraps
+`wind_set` `WF_CURRXYWH`) *before* re-reading `workRect()` and resizing `tree[0]`
+to the new work area.
+
+## Backlog
+
+### window.zig — "Code" button opens the source in a second window
+
+Add a `Code` button to the existing window. On click, open a second window that
+displays the literal contents of `src/window.zig`.
+
+Implementation notes:
+
+- Embed the source at comptime with `@embedFile("window.zig")`; split it into
+  lines (also comptime) and emit one `G_TEXT` node per line, plus a root box and
+  a Close button.
+- The app currently allocates `App(1, 16)` — one view, 16 nodes. A second window
+  needs `max_views = 2`, and `max_nodes` must cover the source line count plus
+  the box/button. `window.zig` is ~45 lines, so `App(2, 64)` is safe.
+- The click handler calls `app.open(...)` mid-run (supported: `run()` re-reads
+  `view_count` every pass). The second window is just another tree; its Close
+  button reuses the existing `WM_CLOSED` path.

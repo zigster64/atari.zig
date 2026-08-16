@@ -1,5 +1,11 @@
 # Build Pipeline: Zig → m68k Atari TOS .PRG
 
+> **Toolchain location:** the m68k-enabled Zig + LLVM toolchain is in
+> **`~/Atari/bin`** (zig, clang, toslink, prgify, m68k-elf-*, …). Build with
+> `~/Atari/bin/zig build` — *not* the system `zig`, which has no m68k backend
+> and fails confusingly. In a sandboxed shell you may also need to redirect the
+> Zig global cache: `ZIG_GLOBAL_CACHE_DIR=~/Atari/.zig-cache-global ~/Atari/bin/zig build`.
+
 ## Overview
 
 This project compiles Zig source code into Atari ST / TOS `.PRG` executables,
@@ -372,6 +378,69 @@ evaluator's default 1000-branch quota, so the helper calls
 Swap-removing a pool entry (`views[i] = views[last]`) copies a whole struct; LLVM
 emits `memmove` for potentially-overlapping copies. Freestanding m68k must
 provide `memmove` (forward/backward byte loop) next to `memcpy`/`memset`.
+
+### m68k backend: indexed byte stores lose their index register
+The LLVM m68k backend has a bug where an indexed byte store
+(`arr[i] = byte_value`) drops the index register and writes every byte to the
+*same* address. Symptom: runtime byte-by-byte buffers come out corrupted — every
+byte ends up equal to the last one written.
+
+This bit us hard: `Track` briefly carried a `drums: [64]u8` byte array, and the
+struct copy (`t.* = parseNotes(...)`) corrupted the whole struct — `count`,
+`notes`, and `active` all came out garbage. That is what caused the "bassline
+stuck on note 1 + noise" bug (see the post-mortem below).
+
+**Rule:** never put a *byte array* in a struct that gets copied on this target.
+Use `u16` word arrays, or encode small enums/flags into spare high bits of an
+existing word. (Scalar `u8`/`bool` fields are fine — the bug is the *indexed*
+byte store, not the byte type.)
+
+### m68k backend: no 32-bit hardware multiply (`__mulsi3`)
+The 68000's `MULU.W` / `MULS.W` only multiply two **16-bit** values. Zig
+`u32 * u32` lowers to a call to the software helper `__mulsi3`, which lives in
+compiler-rt. This project builds with `-fno-compiler-rt` (freestanding), so that
+symbol is never linked → `toslink: undefined reference to '__mulsi3'`.
+
+**Rule:** avoid `u32 * u32` (and `i32 * i32`). Where the multiplier is a power of
+two, use a shift. Note durations do exactly this: `delay_ms << dashes` instead of
+`delay_ms * beats`.
+
+### YM2149 mixer (register R7) bit map
+The mixer selects, per channel, whether its **tone**, its **noise**, both, or
+neither reach the output. Bits are active-low (0 = enabled):
+
+| Bit | Source |
+|-----|--------|
+| 0 | Tone A |
+| 1 | Tone B |
+| 2 | Tone C |
+| 3 | Noise A |
+| 4 | Noise B |
+| 5 | Noise C |
+| 6–7 | I/O ports (not sound) |
+
+There is **one** noise generator (shared; period in R6) but three tone
+generators. Channel volume (R8–R10) is separate — enabling noise in the mixer
+but leaving the channel volume at 0 is still silent.
+
+`playSong` derives the mixer from each part's notes (drum tokens `k/s/h` →
+noise, otherwise → tone) rather than hardcoding A=tone / B,C=noise. This standard
+map matches observed behaviour (`0xFA` = tone A + tone C) but has not been
+empirically verified against the emulator.
+
+### Noise-bug post-mortem
+Symptom: after a broken `playSong`, plain `loop()` melodies had "noise on every
+beat that blanked on the gate".
+
+The gated behaviour was the tell: the noise was on the *active* tone channel, not
+on unmuted noise channels (the sequencer gate only silences active tracks). The
+corrupted `drums` byte array made `emitNote` take the drum branch for a tone
+channel — writing **volume without a tone period** — so the channel rang its
+stale period at full volume, gated per step, which reads as noise.
+
+The fix was the sentinel encoding: drum hits are stored as `0xFFF0+` sentinels in
+the existing `notes` word array instead of a separate byte array, eliminating the
+corruption.
 
 ## GEMZ application model (App / Node / View)
 

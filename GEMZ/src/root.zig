@@ -389,109 +389,231 @@ fn boxFill(color: Color) u16 {
 // Music — YM2149 (PSG) three-voice sequencer
 // ---------------------------------------------------------------------------
 
-/// YM2149 PSG register ports.
-const psg_select: *volatile u8 = @ptrFromInt(0xFF8800);
-const psg_data: *volatile u8 = @ptrFromInt(0xFF8802);
-
 /// Max steps in one note sequence.
 pub const max_notes = 64;
 
 /// A voice channel. The YM2149 has three (A, B, C).
 pub const Channel = enum(u8) { A = 0, B = 1, C = 2 };
 
-/// Musical notes as 12-bit YM2149 tone periods (`period = 125000 / freq`).
-/// Octave convention: octave 0 = scientific octave 1, so `b0` = 61.74 Hz.
-pub const Note = enum(u16) {
-    c0 = 3823,
-    d0 = 3405,
-    e0 = 3034,
-    f0 = 2864,
-    g0 = 2551,
-    a0 = 2273,
-    b0 = 2024,
-    c1 = 1911,
-    d1 = 1703,
-    e1 = 1517,
-    f1 = 1432,
-    g1 = 1276,
-    a1 = 1136,
-    b1 = 1012,
-    c2 = 955,
-    d2 = 851,
-    e2 = 758,
-    f2 = 716,
-    g2 = 638,
-    a2 = 568,
-    b2 = 506,
-
-    pub fn period(self: Note) u16 {
-        return @intFromEnum(self);
-    }
+/// Note periods as 12-bit YM2149 tone values (`period = 125000 / freq`,
+/// A4 = 440 Hz = `a3`). Indexed `[octave][semitone]`; semitone order:
+/// c, db, d, eb, e, f, gb, g, ab, a, bb, b. Octave 0 = scientific octave 1.
+const noteTable = [4][12]u16{
+    .{ 3822, 3608, 3405, 3214, 3034, 2863, 2703, 2551, 2408, 2273, 2145, 2025 },
+    .{ 1911, 1804, 1703, 1607, 1517, 1432, 1351, 1276, 1204, 1136, 1073, 1012 },
+    .{ 956, 902, 851, 804, 758, 716, 676, 638, 602, 568, 536, 506 },
+    .{ 478, 451, 426, 402, 379, 358, 338, 319, 301, 284, 268, 253 },
 };
 
-/// Note lookup by [octave][letter], in semitone order c,d,e,f,g,a,b.
-const noteTable = [3][7]Note{
-    .{ .c0, .d0, .e0, .f0, .g0, .a0, .b0 },
-    .{ .c1, .d1, .e1, .f1, .g1, .a1, .b1 },
-    .{ .c2, .d2, .e2, .f2, .g2, .a2, .b2 },
-};
+/// Silence gap between notes, in 200 Hz ticks (5 ms each). 10 ticks = 50 ms —
+/// long enough to audibly separate the low bass notes.
+const note_gate_ticks: u16 = 10;
+
+/// Coarse wake interval for the AES timer (ms). The sequencer does NOT trust
+/// this for real timing — it reads the 200 Hz hardware counter instead.
+const poll_ms: u16 = 25;
+
+/// XBIOS Gettime (opcode 23) — the 200 Hz system timer count (32-bit, 5 ms per
+/// tick). Called via a trap rather than reading `_hz_200` ($4BA) directly: a
+/// direct low-memory read bus-errors in some emulator/TOS combinations, and the
+/// XBIOS call is the official, TOS-version-safe way to reach the timer.
+fn xbiosGetTime() u32 {
+    var result: u32 = 0;
+    asm volatile (
+        \\move.w #23, -(%%sp)
+        \\trap #14
+        \\lea 2(%%sp), %%sp
+        \\move.l %%d0, %[result]
+        : [result] "=m" (result),
+        : 
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
+    );
+    return result;
+}
+
+/// How long a percussive drum hit rings, in ticks (10 = 50 ms; crude decay).
+const drum_burst_ticks: u16 = 10;
+
+/// Noise period (R6, 0-31) for the shared noise generator; higher = lower pitch.
+/// One value for all drums for now; per-hit pitch comes later.
+const noise_period: u8 = 8;
+
+/// Sentinel values stored in `notes[]` for percussive hits. Tone periods are
+/// 12-bit (<= 0x0FFF), so 0xFFF0.. are unambiguous.
+const drum_kick: u16 = 0xFFF0;
+const drum_snare: u16 = 0xFFF1;
+const drum_hat: u16 = 0xFFF2;
+
+/// Current song rep (loop count of the master track, channel A). A file-scope
+/// variable rather than an `App` field: the large `App` struct's layout is
+/// fragile on the m68k backend, and a field-offset miscompute would corrupt
+/// `music[]`.
+var song_rep: u32 = 0;
 
 /// One sequencer channel: its note buffer + playback state.
 pub const Track = struct {
-    notes: [max_notes]u16 = [_]u16{0} ** max_notes, // 0 = rest
+    notes: [max_notes]u16 = [_]u16{0} ** max_notes, // bits 0-11 = tone period (0 = rest); bits 12-14 = beats-1; >= 0xFFF0 = drum hit
     count: usize = 0,
     index: usize = 0,
-    delay: u16 = 0, // ms per step
+    delay_ticks: u16 = 0, // duration of one beat, in 200 Hz ticks
+    remaining: u16 = 0, // ticks until this track's next state change
     volume: u8 = 0, // 0-15
     looping: bool = false,
     active: bool = false,
+    gate_on: bool = false, // in the silence gap before the next note
+    from_rep: u8 = 0, // first rep this track plays (1-based); 0 = not scheduled
+    to_rep: u8 = 0, // last rep (inclusive); 0 = until song end
 };
 
-fn letterIndex(c: u8) usize {
+/// One scheduled voice in a `playSong` arrangement.
+pub const Part = struct {
+    channel: Channel,
+    notes: []const u8, // comptime pattern string
+    bpm: u8,
+    volume: u8,
+    from_rep: u8, // first rep (1-based)
+    to_rep: u8, // last rep inclusive; 0 = until song end
+};
+
+/// Natural-note semitone index (c=0, d=2, e=4, f=5, g=7, a=9, b=11).
+fn semitone(c: u8) u8 {
     return switch (c) {
         'c' => 0,
-        'd' => 1,
-        'e' => 2,
-        'f' => 3,
-        'g' => 4,
-        'a' => 5,
-        'b' => 6,
+        'd' => 2,
+        'e' => 4,
+        'f' => 5,
+        'g' => 7,
+        'a' => 9,
+        'b' => 11,
         else => 0,
     };
 }
 
-/// Parse a comptime note string ("e1 . d2 , b0 ...") into a track's step buffer.
-/// Tokens: letter+octave (`a`-`g`, case-insensitive, `0`-`2`) = note; `.` = rest;
-/// commas/space and any other characters are skipped.
+/// Parse a comptime note string into a track's step buffer.
+/// Tokens: [letter][`b` = flat][octave] = tone note; `.` = rest; `k`/`s`/`h` =
+/// kick/snare/hat. A trailing `-` doubles the duration (d2- = half note, d2-- =
+/// whole note). Commas/space are skipped. e.g. "e1 b0 d2 b0, k . s . h h"
 fn parseNotes(comptime src: []const u8) Track {
     var out: Track = .{};
     var i: usize = 0;
     while (i < src.len and out.count < max_notes) {
         const c = src[i] | 0x20; // ASCII lower-case (comptime: no runtime cost)
+        var encoded: u16 = 0;
+        var is_step = false;
         if (c == '.') {
-            out.notes[out.count] = 0;
-            out.count += 1;
+            encoded = 0; // rest
+            is_step = true;
             i += 1;
-        } else if (c >= 'a' and c <= 'g' and i + 1 < src.len) {
-            const oct = src[i + 1];
-            if (oct >= '0' and oct <= '2') {
-                out.notes[out.count] = noteTable[oct - '0'][letterIndex(c)].period();
-                out.count += 1;
-                i += 2;
+        } else if (c >= 'a' and c <= 'g') {
+            // [letter] ['b' = flat] [octave]
+            var flat = false;
+            var oct_i = i + 1;
+            if (oct_i < src.len and src[oct_i] == 'b' and oct_i + 1 < src.len and src[oct_i + 1] >= '0' and src[oct_i + 1] <= '3') {
+                flat = true;
+                oct_i += 1;
+            }
+            if (oct_i < src.len and src[oct_i] >= '0' and src[oct_i] <= '3') {
+                const oct: usize = src[oct_i] - '0';
+                const st: usize = if (flat) (semitone(c) + 11) % 12 else semitone(c);
+                encoded = noteTable[oct][st];
+                is_step = true;
+                i = oct_i + 1;
             } else {
                 i += 1;
             }
+        } else if (c == 'k' or c == 's' or c == 'h') {
+            encoded = switch (c) {
+                'k' => drum_kick,
+                's' => drum_snare,
+                'h' => drum_hat,
+                else => 0,
+            };
+            is_step = true;
+            i += 1;
         } else {
             i += 1;
         }
+        if (!is_step) continue;
+
+        // Trailing '-' doubles the duration: d2- = 2 beats, d2-- = 4 beats.
+        var dashes: usize = 0;
+        while (i + dashes < src.len and src[i + dashes] == '-' and dashes < 3) : (dashes += 1) {}
+        i += dashes;
+        if (dashes > 0 and encoded < drum_kick) {
+            encoded |= @as(u16, @intCast(dashes)) << 12;
+        }
+        out.notes[out.count] = encoded;
+        out.count += 1;
     }
     return out;
 }
 
-/// Write a value to a YM2149 register (select, then data).
+/// Total duration of the current step (beat count × one beat), in ticks.
+fn stepTotalTicks(t: *const Track) u16 {
+    const v = t.notes[t.index];
+    if (v >= drum_kick) return t.delay_ticks; // drums are always one beat
+    const dashes: u16 = (v >> 12) & 0x3;
+    const total: u32 = @as(u32, t.delay_ticks) << @intCast(dashes);
+    return @intCast(@min(total, 65535));
+}
+
+/// How long the current step's sound rings before the gate, in ticks.
+fn stepOnTicks(t: *const Track) u16 {
+    const v = t.notes[t.index];
+    if (v >= drum_kick) return drum_burst_ticks;
+    const total: u32 = stepTotalTicks(t);
+    if (total > note_gate_ticks) return @intCast(total - note_gate_ticks);
+    return 1;
+}
+
+/// Comptime scan: does a note string contain any drum token (k/s/h)?
+fn hasDrumToken(comptime notes: []const u8) bool {
+    var i: usize = 0;
+    while (i < notes.len) : (i += 1) {
+        const c = notes[i] | 0x20;
+        if (c == 'k' or c == 's' or c == 'h') return true;
+    }
+    return false;
+}
+
+/// Comptime: derive the mixer byte (R7) for a song — a channel with drum tokens
+/// gets noise routed to it; a channel with tones gets tone; unused stays muted.
+fn songMixer(comptime parts: anytype) u8 {
+    var tone: [3]u8 = .{ 1, 1, 1 };
+    var noise: [3]u8 = .{ 1, 1, 1 };
+    inline for (parts) |p| {
+        const ci: usize = @intFromEnum(p.channel);
+        const drums = hasDrumToken(p.notes);
+        tone[ci] = if (drums) 1 else 0;
+        noise[ci] = if (drums) 0 else 1;
+    }
+    return tone[0] | (tone[1] << 1) | (tone[2] << 2) | (noise[0] << 3) | (noise[1] << 4) | (noise[2] << 5) | 0x40 | 0x80;
+}
+
+/// XBIOS Giaccess (trap #14, opcode 28) — select a PSG register and write data.
+/// Args are passed on the stack (XBIOS convention): push regno, then data,
+/// then the opcode. The dispatcher only *reads* the opcode (its pop is on a
+/// copy of the stack and never commits to usp), so the caller pops opcode +
+/// args = 6 bytes after the trap.
+fn giAccess(data: u16, reg: u16) void {
+    asm volatile (
+        \\move.w %[reg], -(%%sp)
+        \\move.w %[data], -(%%sp)
+        \\move.w #28, -(%%sp)
+        \\trap #14
+        \\lea 6(%%sp), %%sp
+        :
+        : [data] "d" (@as(u32, data)),
+          [reg] "d" (@as(u32, reg)),
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
+    );
+}
+
+/// Write a value to a YM2149 register via XBIOS Giaccess. The register number
+/// carries a flag: bit 7 (GIACCESS_WRITE, 0x80) = write the data; without it
+/// Giaccess only selects the register (read).
 fn psgWrite(reg: u8, val: u8) void {
-    psg_select.* = reg;
-    psg_data.* = val;
+    giAccess(val, reg | 0x80);
 }
 
 /// Write a 12-bit tone period to a channel's period registers (R0/R1..R4/R5).
@@ -786,7 +908,7 @@ noinline fn objcFind(tree: []Object, obj: i16, depth: i16, mx: i16, my: i16) i16
 /// current one, so a fixed `bstate` would spin: `bstate=0` spins while the
 /// button is up, `bstate=1` spins while it is held. Callers must therefore
 /// wait for the press first, then the release.
-noinline fn evntMulti(events: u16, bstate: i16, message: *[16]i16, ev: *Event) void {
+noinline fn evntMulti(events: u16, bstate: i16, timer: u16, message: *[16]i16, ev: *Event) void {
     const int_in = [_]i16{
         @bitCast(events),
         1, // bclicks — a single click
@@ -794,7 +916,7 @@ noinline fn evntMulti(events: u16, bstate: i16, message: *[16]i16, ev: *Event) v
         bstate,
         0, 0, 0, 0, 0, // m1 (unused)
         0, 0, 0, 0, 0, // m2 (unused)
-        0, 0, // timer
+        @intCast(timer), 0, // timer (lo, hi) — ms; 0 = wait forever
     };
     // evnt_multi always takes one addr_in (the 16-word message buffer), even
     // when MU_MESAG is not part of `events`; it is simply left untouched.
@@ -989,31 +1111,201 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             return .{ .id = id, .views = undefined, .view_count = 0, .music = .{ .{}, .{}, .{} } };
         }
 
-        /// Start a one-shot note sequence on a channel. Parses the (comptime)
-        /// note string into periods and arms the track; the run loop steps it.
-        pub fn play(self: *Self, channel: Channel, comptime notes: []const u8, delay: u16, volume: u8) void {
-            self.music[@intFromEnum(channel)] = parseNotes(notes);
+        /// Shared track arming: parse the notes, reset state, and sound the first
+        /// note. Leaves the mixer untouched (the caller sets tone/noise routing).
+        fn armCore(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8, from_rep: u8, to_rep: u8) void {
+            const delay_ticks: u16 = @intCast(12000 / @as(u32, bpm));
             const t = &self.music[@intFromEnum(channel)];
+            t.* = parseNotes(notes);
             t.index = 0;
-            t.delay = delay;
+            t.delay_ticks = delay_ticks;
+            t.remaining = stepOnTicks(t);
             t.volume = volume;
-            t.looping = false;
+            t.looping = true;
             t.active = true;
+            t.gate_on = false;
+            t.from_rep = from_rep;
+            t.to_rep = to_rep;
+            self.emitNote(channel, t); // sound the first note immediately
+        }
+
+        /// Start a one-shot note sequence on a channel. `bpm` is the tempo; one
+        /// step = one beat (quarter note). Stops when the sequence ends.
+        pub fn play(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
+            psgInit(); // simple melodies are tone-only: restore the tone mixer
+            self.armCore(channel, notes, bpm, volume, 0, 0);
+            self.music[@intFromEnum(channel)].looping = false; // one-shot
+        }
+
+        /// Start a looping note sequence on a channel. Same as `play` but it
+        /// restarts from the first note when it reaches the end.
+        pub fn loop(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
+            psgInit(); // simple melodies are tone-only: restore the tone mixer
+            self.armCore(channel, notes, bpm, volume, 0, 0);
+        }
+
+        /// Arrange a full song: each part plays on its channel from `from_rep` to
+        /// `to_rep`. The master clock is channel A — its loop wraps advance the
+        /// rep counter. All parts share the same 16-step / 4-bar grid (one step =
+        /// one beat). `parts` is a comptime array of `Part`.
+        pub fn playSong(self: *Self, comptime parts: anytype) void {
+            // Arm every part via the proven loop() path, then route the mixer
+            // for tone/noise per channel. (stopMusic already ran in form_choice.)
+            song_rep = 1;
+            self.armAll(parts, 0);
+            psgWrite(7, songMixer(parts));
+            psgWrite(6, noise_period);
+        }
+
+        /// Comptime-recursive part arming: loop() per part (the proven path),
+        /// then apply rep scheduling.
+        fn armAll(self: *Self, comptime parts: anytype, comptime i: usize) void {
+            if (i == parts.len) return;
+            const p = parts[i];
+            self.loop(p.channel, p.notes, p.bpm, p.volume);
+            const t = &self.music[@intFromEnum(p.channel)];
+            t.from_rep = p.from_rep;
+            t.to_rep = p.to_rep;
+            if (p.from_rep > 1) {
+                // Not due yet — silence and mark dormant until its start rep.
+                psgWriteVolume(p.channel, 0);
+                t.active = false;
+            }
+            self.armAll(parts, i + 1);
+        }
+
+        /// Advance the rep counter after a master loop and (de)activate any
+        /// scheduled tracks that are now due to start or stop.
+        fn advanceSchedule(self: *Self) void {
+            song_rep += 1;
+            for (&self.music, 0..) |*t, ch| {
+                if (t.from_rep == 0) continue;
+                const chan: Channel = @enumFromInt(@as(u8, @intCast(ch)));
+                if (!t.active and song_rep >= t.from_rep) {
+                    t.active = true;
+                    t.index = 0;
+                    t.gate_on = false;
+                    t.remaining = stepOnTicks(t);
+                    self.emitNote(chan, t);
+                } else if (t.active and t.to_rep != 0 and song_rep > t.to_rep) {
+                    psgWriteVolume(chan, 0);
+                    t.active = false;
+                }
+            }
+        }
+
+        /// Write the step at a track's current index to its channel: a tone note
+        /// (period + volume) or a percussive drum hit (noise volume burst).
+        fn emitNote(_: *Self, channel: Channel, t: *Track) void {
+            const v = t.notes[t.index];
+            if (v >= drum_kick) {
+                // Drum hit: noise is already enabled on this channel (mixer set by
+                // playSong) and R6 is shared; just raise the volume. stepMusic
+                // drops it back to 0 after `stepOnTicks` for a crude percussive decay.
+                psgWriteVolume(channel, t.volume);
+            } else {
+                const period = v & 0x0FFF;
+                if (period == 0) {
+                    psgWriteVolume(channel, 0);
+                } else {
+                    psgWritePeriod(channel, period);
+                    psgWriteVolume(channel, t.volume);
+                }
+            }
+        }
+
+        /// True while any track is active (drives the run-loop poll).
+        fn anyMusicActive(self: *Self) bool {
+            for (&self.music) |*t| {
+                if (t.active) return true;
+            }
+            return false;
+        }
+
+        /// Advance every active track by `elapsed` ms, stepping the ones due.
+        /// Each step sounds for its own duration, then goes silent for the
+        /// gate, so notes/drum hits don't bleed into each other.
+        fn stepMusic(self: *Self, elapsed: u16) void {
+            var master_wrapped = false;
+            for (&self.music, 0..) |*t, ch| {
+                if (!t.active) continue;
+                if (t.remaining > elapsed) {
+                    t.remaining -= elapsed;
+                    continue;
+                }
+                const chan: Channel = @enumFromInt(@as(u8, @intCast(ch)));
+                if (t.gate_on) {
+                    // Gate finished — sound this step.
+                    t.gate_on = false;
+                    t.remaining = stepOnTicks(t);
+                    self.emitNote(chan, t);
+                } else {
+                    // Step finished — silence and begin the gate.
+                    psgWriteVolume(chan, 0);
+                    const gate = stepTotalTicks(t) - stepOnTicks(t);
+                    t.index += 1;
+                    if (t.index >= t.count) {
+                        if (t.looping) {
+                            t.index = 0;
+                            t.gate_on = true;
+                            t.remaining = gate;
+                            // The master (channel A) drives the song clock.
+                            if (ch == 0 and t.from_rep != 0) master_wrapped = true;
+                        } else {
+                            psgWriteVolume(chan, 0);
+                            t.active = false;
+                        }
+                    } else {
+                        t.gate_on = true;
+                        t.remaining = gate;
+                    }
+                }
+            }
+            if (master_wrapped) self.advanceSchedule();
         }
 
         /// `appl_exit` — release the application from the AES.
         pub fn exit(_: *Self) void {
+            // Silence all PSG channels so the sound stops with the app (a
+            // ringing square wave would otherwise keep sounding after quit).
+            psgWriteVolume(.A, 0);
+            psgWriteVolume(.B, 0);
+            psgWriteVolume(.C, 0);
             const args = AesArgs.none();
             _ = aesCall(.appl_exit, &args);
         }
 
-        /// `form_alert` — show a modal alert dialog.
-        pub fn form_alert(_: *const Self, button: AlertButton, comptime text: []const u8) void {
+        /// Stop all tracks and silence every PSG channel.
+        pub fn stopMusic(self: *Self) void {
+            for (&self.music) |*t| {
+                t.active = false;
+                t.gate_on = false;
+            }
+            psgWriteVolume(.A, 0);
+            psgWriteVolume(.B, 0);
+            psgWriteVolume(.C, 0);
+        }
+
+        /// `form_alert` — show a modal alert dialog. Silences any playing music
+        /// first (modal dialogs block the sequencer).
+        pub fn form_alert(self: *Self, button: AlertButton, comptime text: []const u8) void {
+            self.stopMusic();
             const msg: [*:0]const u8 = "[1][" ++ text ++ "][ OK ]";
             const int_in = [_]i16{@intFromEnum(button)};
             const addr_in = [_]?[*]const u8{@ptrCast(msg)};
             const args = AesArgs.from(&int_in, &addr_in, 1);
             _ = aesCall(.form_alert, &args);
+        }
+
+        /// `form_alert` with custom buttons — returns the 1-based index of the
+        /// button pressed (e.g. 1 = first, 2 = second). Silences music first.
+        pub fn form_choice(self: *Self, button: AlertButton, comptime text: []const u8, comptime buttons: []const u8) i16 {
+            self.stopMusic();
+            const msg: [*:0]const u8 = "[1][" ++ text ++ "][" ++ buttons ++ "]";
+            const int_in = [_]i16{@intFromEnum(button)};
+            const addr_in = [_]?[*]const u8{@ptrCast(msg)};
+            const args = AesArgs.from(&int_in, &addr_in, 1);
+            return aesCall(.form_alert, &args);
         }
 
         /// Create + open a window and register it (and its tree + bindings).
@@ -1045,14 +1337,31 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
 
             // `appl_init` leaves the app in the busy (hourglass) state.
             grafMouse(GrafMouse.arrow);
+            psgInit();
 
+            var last_ticks: u32 = xbiosGetTime();
             while (true) {
                 if (self.view_count == 0) return;
 
-                evntMulti(EventMask.button | EventMask.mesag, 1, &msg, &ev);
+                // Wake every `poll_ms` while music plays, but measure the real
+                // elapsed from the 200 Hz counter (5 ms granularity) so the AES
+                // timer's jitter/coarseness never affects tempo.
+                const playing = self.anyMusicActive();
+                const poll: u16 = if (playing) poll_ms else 0;
+                const events = if (playing)
+                    EventMask.button | EventMask.mesag | EventMask.timer
+                else
+                    EventMask.button | EventMask.mesag;
+                evntMulti(events, 1, poll, &msg, &ev);
+
+                const now = xbiosGetTime();
+                var ticks: u16 = @intCast(now -% last_ticks);
+                last_ticks = now;
+                if (ticks == 0) ticks = poll_ms / 5; // timer not advanced: use full poll
 
                 if ((ev.ev & EventMask.mesag) != 0) self.handleMessage(&msg);
                 if ((ev.ev & EventMask.button) != 0) self.handleClick(ev.mx, ev.my);
+                if (playing) self.stepMusic(ticks);
             }
         }
 
@@ -1141,7 +1450,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             // spin and a modal dialog doesn't misread the release as its own.
             var release: Event = undefined;
             var msg: [16]i16 = undefined;
-            evntMulti(EventMask.button, 0, &msg, &release);
+            evntMulti(EventMask.button, 0, 0, &msg, &release);
 
             const origin = v.window.workOrigin();
             const obj = objcFind(v.treeSlice(), 0, 8, mx - origin.x, my - origin.y);
@@ -1161,6 +1470,12 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
                     else => {},
                 }
             }
+
+            // A click handler may have shown a modal dialog (form_alert), which
+            // EmuTOS returns from on the button *press* — the button is still
+            // down. Swallow that release so the run loop's next wait-for-press
+            // doesn't re-fire on the same physical click (and stop the music).
+            evntMulti(EventMask.button, 0, 0, &msg, &release);
         }
     };
 }

@@ -385,6 +385,132 @@ fn boxFill(color: Color) u16 {
     return c | (@as(u16, 1) << 4) | (c << 12);
 }
 
+// ---------------------------------------------------------------------------
+// Music — YM2149 (PSG) three-voice sequencer
+// ---------------------------------------------------------------------------
+
+/// YM2149 PSG register ports.
+const psg_select: *volatile u8 = @ptrFromInt(0xFF8800);
+const psg_data: *volatile u8 = @ptrFromInt(0xFF8802);
+
+/// Max steps in one note sequence.
+pub const max_notes = 64;
+
+/// A voice channel. The YM2149 has three (A, B, C).
+pub const Channel = enum(u8) { A = 0, B = 1, C = 2 };
+
+/// Musical notes as 12-bit YM2149 tone periods (`period = 125000 / freq`).
+/// Octave convention: octave 0 = scientific octave 1, so `b0` = 61.74 Hz.
+pub const Note = enum(u16) {
+    c0 = 3823,
+    d0 = 3405,
+    e0 = 3034,
+    f0 = 2864,
+    g0 = 2551,
+    a0 = 2273,
+    b0 = 2024,
+    c1 = 1911,
+    d1 = 1703,
+    e1 = 1517,
+    f1 = 1432,
+    g1 = 1276,
+    a1 = 1136,
+    b1 = 1012,
+    c2 = 955,
+    d2 = 851,
+    e2 = 758,
+    f2 = 716,
+    g2 = 638,
+    a2 = 568,
+    b2 = 506,
+
+    pub fn period(self: Note) u16 {
+        return @intFromEnum(self);
+    }
+};
+
+/// Note lookup by [octave][letter], in semitone order c,d,e,f,g,a,b.
+const noteTable = [3][7]Note{
+    .{ .c0, .d0, .e0, .f0, .g0, .a0, .b0 },
+    .{ .c1, .d1, .e1, .f1, .g1, .a1, .b1 },
+    .{ .c2, .d2, .e2, .f2, .g2, .a2, .b2 },
+};
+
+/// One sequencer channel: its note buffer + playback state.
+pub const Track = struct {
+    notes: [max_notes]u16 = [_]u16{0} ** max_notes, // 0 = rest
+    count: usize = 0,
+    index: usize = 0,
+    delay: u16 = 0, // ms per step
+    volume: u8 = 0, // 0-15
+    looping: bool = false,
+    active: bool = false,
+};
+
+fn letterIndex(c: u8) usize {
+    return switch (c) {
+        'c' => 0,
+        'd' => 1,
+        'e' => 2,
+        'f' => 3,
+        'g' => 4,
+        'a' => 5,
+        'b' => 6,
+        else => 0,
+    };
+}
+
+/// Parse a comptime note string ("e1 . d2 , b0 ...") into a track's step buffer.
+/// Tokens: letter+octave (`a`-`g`, case-insensitive, `0`-`2`) = note; `.` = rest;
+/// commas/space and any other characters are skipped.
+fn parseNotes(comptime src: []const u8) Track {
+    var out: Track = .{};
+    var i: usize = 0;
+    while (i < src.len and out.count < max_notes) {
+        const c = src[i] | 0x20; // ASCII lower-case (comptime: no runtime cost)
+        if (c == '.') {
+            out.notes[out.count] = 0;
+            out.count += 1;
+            i += 1;
+        } else if (c >= 'a' and c <= 'g' and i + 1 < src.len) {
+            const oct = src[i + 1];
+            if (oct >= '0' and oct <= '2') {
+                out.notes[out.count] = noteTable[oct - '0'][letterIndex(c)].period();
+                out.count += 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    return out;
+}
+
+/// Write a value to a YM2149 register (select, then data).
+fn psgWrite(reg: u8, val: u8) void {
+    psg_select.* = reg;
+    psg_data.* = val;
+}
+
+/// Write a 12-bit tone period to a channel's period registers (R0/R1..R4/R5).
+fn psgWritePeriod(channel: Channel, period: u16) void {
+    const base: u8 = @intFromEnum(channel) * 2;
+    psgWrite(base, @intCast(period & 0xFF));
+    psgWrite(base + 1, @intCast((period >> 8) & 0x0F));
+}
+
+/// Write a channel's volume (R8/R9/R10). 0-15, 0 = silent.
+fn psgWriteVolume(channel: Channel, volume: u8) void {
+    psgWrite(8 + @intFromEnum(channel), volume & 0x0F);
+}
+
+/// Initialise the PSG: tone on for all three channels, noise off.
+fn psgInit() void {
+    psgWrite(7, 0xFA);
+}
+
 /// GEM text info (`TEDINFO`). `G_TEXT`, `G_BOXTEXT`, `G_FTEXT` and `G_FBOXTEXT`
 /// objects point at this instead of a raw string — EmuTOS dereferences it as a
 /// pointer-to-structure. `G_BUTTON` uses a plain string, not a TEDINFO.
@@ -853,13 +979,26 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         id: i16,
         views: [max_views]View,
         view_count: usize,
+        music: [3]Track,
 
         /// `appl_init` — register the application with the AES.
         pub fn init() !Self {
             const args = AesArgs.none();
             const id = aesCall(.appl_init, &args);
             if (id == -1) return error.ApplInitFailed;
-            return .{ .id = id, .views = undefined, .view_count = 0 };
+            return .{ .id = id, .views = undefined, .view_count = 0, .music = .{ .{}, .{}, .{} } };
+        }
+
+        /// Start a one-shot note sequence on a channel. Parses the (comptime)
+        /// note string into periods and arms the track; the run loop steps it.
+        pub fn play(self: *Self, channel: Channel, comptime notes: []const u8, delay: u16, volume: u8) void {
+            self.music[@intFromEnum(channel)] = parseNotes(notes);
+            const t = &self.music[@intFromEnum(channel)];
+            t.index = 0;
+            t.delay = delay;
+            t.volume = volume;
+            t.looping = false;
+            t.active = true;
         }
 
         /// `appl_exit` — release the application from the AES.

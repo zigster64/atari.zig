@@ -444,12 +444,6 @@ const drum_kick: u16 = 0xFFF0;
 const drum_snare: u16 = 0xFFF1;
 const drum_hat: u16 = 0xFFF2;
 
-/// Current song rep (loop count of the master track, channel A). A file-scope
-/// variable rather than an `App` field: the large `App` struct's layout is
-/// fragile on the m68k backend, and a field-offset miscompute would corrupt
-/// `music[]`.
-var song_rep: u32 = 0;
-
 /// One sequencer channel: its note buffer + playback state.
 pub const Track = struct {
     notes: [max_notes]u16 = [_]u16{0} ** max_notes, // bits 0-11 = tone period (0 = rest); bits 12-14 = beats-1; >= 0xFFF0 = drum hit
@@ -461,15 +455,12 @@ pub const Track = struct {
     looping: bool = false,
     active: bool = false,
     gate_on: bool = false, // in the silence gap before the next note
-    from_rep: u8 = 0, // first rep this track plays (1-based); 0 = not scheduled
-    to_rep: u8 = 0, // last rep (inclusive); 0 = until song end
 };
 
 /// One scheduled voice in a `playSong` arrangement.
 pub const Part = struct {
     channel: Channel,
     notes: []const u8, // comptime pattern string
-    bpm: u8,
     volume: u8,
     from_rep: u8, // first rep (1-based)
     to_rep: u8, // last rep inclusive; 0 = until song end
@@ -1113,7 +1104,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
 
         /// Shared track arming: parse the notes, reset state, and sound the first
         /// note. Leaves the mixer untouched (the caller sets tone/noise routing).
-        fn armCore(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8, from_rep: u8, to_rep: u8) void {
+        fn armCore(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
             const delay_ticks: u16 = @intCast(12000 / @as(u32, bpm));
             const t = &self.music[@intFromEnum(channel)];
             t.* = parseNotes(notes);
@@ -1124,8 +1115,6 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             t.looping = true;
             t.active = true;
             t.gate_on = false;
-            t.from_rep = from_rep;
-            t.to_rep = to_rep;
             self.emitNote(channel, t); // sound the first note immediately
         }
 
@@ -1133,7 +1122,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         /// step = one beat (quarter note). Stops when the sequence ends.
         pub fn play(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
             psgInit(); // simple melodies are tone-only: restore the tone mixer
-            self.armCore(channel, notes, bpm, volume, 0, 0);
+            self.armCore(channel, notes, bpm, volume);
             self.music[@intFromEnum(channel)].looping = false; // one-shot
         }
 
@@ -1141,57 +1130,28 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         /// restarts from the first note when it reaches the end.
         pub fn loop(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
             psgInit(); // simple melodies are tone-only: restore the tone mixer
-            self.armCore(channel, notes, bpm, volume, 0, 0);
+            self.armCore(channel, notes, bpm, volume);
         }
 
         /// Arrange a full song: each part plays on its channel from `from_rep` to
         /// `to_rep`. The master clock is channel A — its loop wraps advance the
         /// rep counter. All parts share the same 16-step / 4-bar grid (one step =
         /// one beat). `parts` is a comptime array of `Part`.
-        pub fn playSong(self: *Self, comptime parts: anytype) void {
+        pub fn playSong(self: *Self, comptime parts: anytype, bpm: u8) void {
             // Arm every part via the proven loop() path, then route the mixer
             // for tone/noise per channel. (stopMusic already ran in form_choice.)
-            song_rep = 1;
-            self.armAll(parts, 0);
+            self.armAll(parts, 0, bpm);
             psgWrite(7, songMixer(parts));
             psgWrite(6, noise_period);
         }
 
         /// Comptime-recursive part arming: loop() per part (the proven path),
         /// then apply rep scheduling.
-        fn armAll(self: *Self, comptime parts: anytype, comptime i: usize) void {
+        fn armAll(self: *Self, comptime parts: anytype, comptime i: usize, bpm: u8) void {
             if (i == parts.len) return;
             const p = parts[i];
-            self.loop(p.channel, p.notes, p.bpm, p.volume);
-            const t = &self.music[@intFromEnum(p.channel)];
-            t.from_rep = p.from_rep;
-            t.to_rep = p.to_rep;
-            if (p.from_rep > 1) {
-                // Not due yet — silence and mark dormant until its start rep.
-                psgWriteVolume(p.channel, 0);
-                t.active = false;
-            }
-            self.armAll(parts, i + 1);
-        }
-
-        /// Advance the rep counter after a master loop and (de)activate any
-        /// scheduled tracks that are now due to start or stop.
-        fn advanceSchedule(self: *Self) void {
-            song_rep += 1;
-            for (&self.music, 0..) |*t, ch| {
-                if (t.from_rep == 0) continue;
-                const chan: Channel = @enumFromInt(@as(u8, @intCast(ch)));
-                if (!t.active and song_rep >= t.from_rep) {
-                    t.active = true;
-                    t.index = 0;
-                    t.gate_on = false;
-                    t.remaining = stepOnTicks(t);
-                    self.emitNote(chan, t);
-                } else if (t.active and t.to_rep != 0 and song_rep > t.to_rep) {
-                    psgWriteVolume(chan, 0);
-                    t.active = false;
-                }
-            }
+            self.loop(p.channel, p.notes, bpm, p.volume);
+            self.armAll(parts, i + 1, bpm);
         }
 
         /// Write the step at a track's current index to its channel: a tone note
@@ -1226,7 +1186,6 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         /// Each step sounds for its own duration, then goes silent for the
         /// gate, so notes/drum hits don't bleed into each other.
         fn stepMusic(self: *Self, elapsed: u16) void {
-            var master_wrapped = false;
             for (&self.music, 0..) |*t, ch| {
                 if (!t.active) continue;
                 if (t.remaining > elapsed) {
@@ -1249,8 +1208,6 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
                             t.index = 0;
                             t.gate_on = true;
                             t.remaining = gate;
-                            // The master (channel A) drives the song clock.
-                            if (ch == 0 and t.from_rep != 0) master_wrapped = true;
                         } else {
                             psgWriteVolume(chan, 0);
                             t.active = false;
@@ -1261,7 +1218,6 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
                     }
                 }
             }
-            if (master_wrapped) self.advanceSchedule();
         }
 
         /// `appl_exit` — release the application from the AES.

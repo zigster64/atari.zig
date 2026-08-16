@@ -20,16 +20,16 @@ const DAF_LOGO = gemz.BitBlk.from(&logo_daf.DAF96, .white);
 // TODO tech debt - sounds ok at 100bpm, terrible below that, with notes running into each other
 const mussoliniSong = [_]gemz.Part{
     // Das bassline
-    .{ .channel = .A, .notes = "e1 b0 d2 b0, b1 b0 b0 b1, b0 b1 b0 b1, a1 b0 b1 b0", .bpm = 100, .volume = 15, .from_rep = 1, .to_rep = 12 },
+    .{ .channel = .A, .notes = "e1 b0 d2 b0, b1 b0 b0 b1, b0 b1 b0 b1, a1 b0 b1 b0", .volume = 15, .from_rep = 1, .to_rep = 12 },
     // Den Drum Kick starts on the 3rd rep
-    .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . .", .bpm = 100, .volume = 15, .from_rep = 3, .to_rep = 12 },
+    .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . .", .volume = 15, .from_rep = 3, .to_rep = 12 },
     // Und denn das Hat und Snare drum muss gepoken its fingerpicken in den song spielen !
-    // .{ .channel = .C, .notes = "h h h h s h h h h h h h s h h h", .bpm = 80, .volume = 8, .from_rep = 4, .to_rep = 12 },
+    // .{ .channel = .C, .notes = "h h h h s h h h h h h h s h h h", .volume = 8, .from_rep = 4, .to_rep = 12 },
 };
 
 fn mussolini(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Der Mussolini|DAF - Alles ist gut (1981)", " Play | Close ")) {
-        1 => app.playSong(mussoliniSong),
+        1 => app.playSong(mussoliniSong, 100),
         // 1 => app.loop(.A, "e1 b0 d2 b0   b1 b0 b0 b1   b0 b1 b0 b1   a1 b0 b1 b0", 100, 15),
         else => {},
     }

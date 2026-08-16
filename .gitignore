@@ -6,7 +6,7 @@ libexec
 include
 launch.sh
 share
-.zig-cache
+.zig-cache*
 zig-out
 .DS_Store
 ROM

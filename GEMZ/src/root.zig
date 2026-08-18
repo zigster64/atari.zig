@@ -410,14 +410,16 @@ const noteTable = [4][12]u16{
 const note_gate_ticks: u16 = 10;
 
 /// Coarse wake interval for the AES timer (ms). The sequencer does NOT trust
-/// this for real timing — it reads the 200 Hz hardware counter instead.
+/// this for real timing — it reads the hardware counter instead.
 const poll_ms: u16 = 25;
 
-/// XBIOS Gettime (opcode 23) — the 200 Hz system timer count (32-bit, 5 ms per
-/// tick). Called via a trap rather than reading `_hz_200` ($4BA) directly: a
-/// direct low-memory read bus-errors in some emulator/TOS combinations, and the
-/// XBIOS call is the official, TOS-version-safe way to reach the timer.
-fn xbiosGetTime() u32 {
+/// The sequencer clock. XBIOS Gettime (opcode 23) returns the keyboard RTC in
+/// DOS format, NOT the true 200 Hz counter. The real `_hz_200` lives at $4BA
+/// with no XBIOS call; direct user-mode reads bus-error in this STE/Hatari
+/// combo, and the supervisor-mode workarounds (Supexec) also fault — so we
+/// step against opcode 23, and `armCore` calibrates `delay_ticks` to its
+/// OBSERVED effective rate (240 bpm input == ~750 ms per step).
+fn hz200() u32 {
     var result: u32 = 0;
     asm volatile (
         \\move.w #23, -(%%sp)
@@ -425,7 +427,7 @@ fn xbiosGetTime() u32 {
         \\lea 2(%%sp), %%sp
         \\move.l %%d0, %[result]
         : [result] "=m" (result),
-        : 
+        :
         : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
     );
     return result;
@@ -539,22 +541,153 @@ fn parseNotes(comptime src: []const u8) Track {
     return out;
 }
 
+/// Comptime: shift a note string by whole octaves (positive = up, negative =
+/// down). Returns a comptime string with each tone's octave digit adjusted and
+/// clamped to 0-3. Rests, drums, flats and duration dashes pass through
+/// unchanged. Use as: `.notes = pitchShift("e1 b0 d2 b0", 1)`.
+pub fn pitchShift(comptime src: []const u8, comptime shift: i8) []const u8 {
+    const result = comptime shiftOctave(src, shift);
+    return &result;
+}
+
+fn shiftOctave(comptime src: []const u8, comptime shift: i8) [src.len]u8 {
+    var out: [src.len]u8 = undefined;
+    for (src, 0..) |ch, i| out[i] = ch;
+    for (src, 0..) |ch, i| {
+        const c = ch | 0x20; // ASCII lower-case
+        if (c >= 'a' and c <= 'g') {
+            // [letter] ['b' = flat] [octave]
+            var j = i + 1;
+            if (j < src.len and src[j] == 'b') j += 1;
+            if (j < src.len and src[j] >= '0' and src[j] <= '3') {
+                const oct: i8 = @intCast(src[j] - '0');
+                const shifted = oct + shift;
+                const clamped: u8 = if (shifted < 0) 0 else if (shifted > 3) 3 else @intCast(shifted);
+                out[j] = '0' + clamped;
+            }
+        }
+    }
+    return out;
+}
+
+/// Comptime: transpose a note string by whole semitones (positive = up,
+/// negative = down). Tone note names are rewritten to the nearest flat-spelled
+/// pitch (c, db, d, eb, e, f, gb, g, ab, a, bb, b); rests, drums, flats and
+/// duration dashes pass through unchanged. Octaves clamp to 0-3.
+/// Use as: `.notes = transpose("e1 b0 d2 b0", -4)` (down a major third).
+///
+/// NOTE: this is the semitone version. `pitchShift` above is the whole-octave
+/// (12-semitone) special case.
+pub fn transpose(comptime src: []const u8, comptime shift: i8) []const u8 {
+    const result = comptime transposeImpl(src, shift);
+    return &result;
+}
+
+const noteNames = [12][]const u8{ "c", "db", "d", "eb", "e", "f", "gb", "g", "ab", "a", "bb", "b" };
+
+fn noteSemitone(c: u8, flat: bool) u8 {
+    const base = semitone(c);
+    return if (flat) (base + 11) % 12 else base;
+}
+
+fn transposedLen(comptime src: []const u8, comptime shift: i8) usize {
+    comptime var len: usize = 0;
+    comptime var i: usize = 0;
+    inline while (i < src.len) {
+        const c = src[i] | 0x20;
+        if (c >= 'a' and c <= 'g') {
+            var flat = false;
+            var j = i + 1;
+            if (j < src.len and src[j] == 'b') {
+                flat = true;
+                j += 1;
+            }
+            if (j < src.len and src[j] >= '0' and src[j] <= '3') {
+                const oct: i16 = @intCast(src[j] - '0');
+                const st: i16 = @intCast(noteSemitone(c, flat));
+                const total: i16 = oct * 12 + st + shift;
+                const st_new: i16 = @mod(total, 12);
+                len += noteNames[@intCast(st_new)].len + 1; // name + octave digit
+                i = j + 1;
+                while (i < src.len and src[i] == '-') : (i += 1) {
+                    len += 1;
+                }
+                continue;
+            }
+        }
+        len += 1;
+        i += 1;
+    }
+    return len;
+}
+
+fn transposeImpl(comptime src: []const u8, comptime shift: i8) [transposedLen(src, shift)]u8 {
+    var out: [transposedLen(src, shift)]u8 = undefined;
+    comptime var o: usize = 0;
+    comptime var i: usize = 0;
+    inline while (i < src.len) {
+        const c = src[i] | 0x20;
+        if (c >= 'a' and c <= 'g') {
+            var flat = false;
+            var j = i + 1;
+            if (j < src.len and src[j] == 'b') {
+                flat = true;
+                j += 1;
+            }
+            if (j < src.len and src[j] >= '0' and src[j] <= '3') {
+                const oct: i16 = @intCast(src[j] - '0');
+                const st: i16 = @intCast(noteSemitone(c, flat));
+                const total: i16 = oct * 12 + st + shift;
+                var oct_new: i16 = @divFloor(total, 12);
+                const st_new: i16 = @mod(total, 12);
+                if (oct_new < 0) oct_new = 0;
+                if (oct_new > 3) oct_new = 3;
+                const name = noteNames[@intCast(st_new)];
+                inline for (name) |ch| {
+                    out[o] = ch;
+                    o += 1;
+                }
+                out[o] = '0' + @as(u8, @intCast(oct_new));
+                o += 1;
+                i = j + 1;
+                while (i < src.len and src[i] == '-') : (i += 1) {
+                    out[o] = '-';
+                    o += 1;
+                }
+                continue;
+            }
+        }
+        out[o] = src[i];
+        o += 1;
+        i += 1;
+    }
+    return out;
+}
+
 /// Total duration of the current step (beat count × one beat), in ticks.
+/// NOTE: the drum check is written as `v < drum_kick` (tone path first) — the
+/// m68k backend swaps the branch targets of `v >= drum_kick`, but compiles the
+/// `<` form correctly (verified in the shipped binary).
 fn stepTotalTicks(t: *const Track) u16 {
     const v = t.notes[t.index];
-    if (v >= drum_kick) return t.delay_ticks; // drums are always one beat
-    const dashes: u16 = (v >> 12) & 0x3;
-    const total: u32 = @as(u32, t.delay_ticks) << @intCast(dashes);
-    return @intCast(@min(total, 65535));
+    if (v < drum_kick) {
+        const dashes: u16 = (v >> 12) & 0x3;
+        const total: u32 = @as(u32, t.delay_ticks) << @intCast(dashes);
+        return @intCast(@min(total, 65535));
+    }
+    return t.delay_ticks; // drums are always one beat
 }
 
 /// How long the current step's sound rings before the gate, in ticks.
+/// Same `<` form as above to dodge the backend's `>=` branch swap.
 fn stepOnTicks(t: *const Track) u16 {
     const v = t.notes[t.index];
-    if (v >= drum_kick) return drum_burst_ticks;
-    const total: u32 = stepTotalTicks(t);
-    if (total > note_gate_ticks) return @intCast(total - note_gate_ticks);
-    return 1;
+    if (v < drum_kick) {
+        const total: u32 = stepTotalTicks(t);
+        if (total > note_gate_ticks) return @intCast(total - note_gate_ticks);
+        return 1;
+    }
+    return drum_burst_ticks;
 }
 
 /// Comptime scan: does a note string contain any drum token (k/s/h)?
@@ -570,15 +703,16 @@ fn hasDrumToken(comptime notes: []const u8) bool {
 /// Comptime: derive the mixer byte (R7) for a song — a channel with drum tokens
 /// gets noise routed to it; a channel with tones gets tone; unused stays muted.
 fn songMixer(comptime parts: anytype) u8 {
-    var tone: [3]u8 = .{ 1, 1, 1 };
-    var noise: [3]u8 = .{ 1, 1, 1 };
-    inline for (parts) |p| {
-        const ci: usize = @intFromEnum(p.channel);
-        const drums = hasDrumToken(p.notes);
-        tone[ci] = if (drums) 1 else 0;
-        noise[ci] = if (drums) 0 else 1;
-    }
-    return tone[0] | (tone[1] << 1) | (tone[2] << 2) | (noise[0] << 3) | (noise[1] << 4) | (noise[2] << 5) | 0x40 | 0x80;
+    return comptime blk: {
+        var mixer: u8 = 0x3F;
+        for (parts) |p| {
+            const drums = hasDrumToken(p.notes);
+            const ch: u3 = @intCast(@intFromEnum(p.channel));
+            const bit: u3 = if (drums) 3 + ch else ch;
+            mixer &= ~(@as(u8, 1) << bit);
+        }
+        break :blk mixer | 0xC0;
+    };
 }
 
 /// XBIOS Giaccess (trap #14, opcode 28) — select a PSG register and write data.
@@ -1093,6 +1227,9 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         views: [max_views]View,
         view_count: usize,
         music: [3]Track,
+        song_advancer: ?*const fn (*Self, u8, u8) void = null,
+        song_bpm: u8 = 0,
+        song_rep: u8 = 0,
 
         /// `appl_init` — register the application with the AES.
         pub fn init() !Self {
@@ -1105,9 +1242,18 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         /// Shared track arming: parse the notes, reset state, and sound the first
         /// note. Leaves the mixer untouched (the caller sets tone/noise routing).
         fn armCore(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
-            const delay_ticks: u16 = @intCast(12000 / @as(u32, bpm));
+            // Calibrated to the OBSERVED effective rate of the opcode-23 clock
+            // (240 bpm input == ~750 ms/step, i.e. ~15 ms/tick): ticks per beat
+            // = 60000 ms / (bpm × 15 ms) = 4000 / bpm. Revisit once the true
+            // 200 Hz counter ($4BA) is reachable.
+            const delay_ticks: u16 = @intCast(4000 / @as(u32, bpm));
             const t = &self.music[@intFromEnum(channel)];
-            t.* = parseNotes(notes);
+            // Force comptime evaluation: the m68k backend miscompiles the
+            // runtime `parseNotes` loop (its loop-bound reload is skipped on
+            // `continue`, so the string index runs past the note data and
+            // bus-errors). Baking the parsed Track in as a constant sidesteps
+            // that entire runtime loop.
+            t.* = comptime parseNotes(notes);
             t.index = 0;
             t.delay_ticks = delay_ticks;
             t.remaining = stepOnTicks(t);
@@ -1121,6 +1267,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         /// Start a one-shot note sequence on a channel. `bpm` is the tempo; one
         /// step = one beat (quarter note). Stops when the sequence ends.
         pub fn play(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
+            self.song_advancer = null;
             psgInit(); // simple melodies are tone-only: restore the tone mixer
             self.armCore(channel, notes, bpm, volume);
             self.music[@intFromEnum(channel)].looping = false; // one-shot
@@ -1129,6 +1276,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         /// Start a looping note sequence on a channel. Same as `play` but it
         /// restarts from the first note when it reaches the end.
         pub fn loop(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
+            self.song_advancer = null;
             psgInit(); // simple melodies are tone-only: restore the tone mixer
             self.armCore(channel, notes, bpm, volume);
         }
@@ -1138,32 +1286,57 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         /// rep counter. All parts share the same 16-step / 4-bar grid (one step =
         /// one beat). `parts` is a comptime array of `Part`.
         pub fn playSong(self: *Self, comptime parts: anytype, bpm: u8) void {
-            // Arm every part via the proven loop() path, then route the mixer
-            // for tone/noise per channel. (stopMusic already ran in form_choice.)
-            self.armAll(parts, 0, bpm);
+            self.song_advancer = repAdvance(parts);
+            self.song_bpm = bpm;
+            self.song_rep = 1;
+            self.armRep(parts, 0, 1, bpm);
             psgWrite(7, songMixer(parts));
             psgWrite(6, noise_period);
         }
 
-        /// Comptime-recursive part arming: loop() per part (the proven path),
-        /// then apply rep scheduling.
-        fn armAll(self: *Self, comptime parts: anytype, comptime i: usize, bpm: u8) void {
+        /// Comptime-recursive arming for the parts whose `from_rep` equals `rep`.
+        /// Uses `armCore` (not `loop`) so the song mixer written by `playSong`
+        /// survives rep transitions.
+        fn armRep(self: *Self, comptime parts: anytype, comptime i: usize, rep: u8, bpm: u8) void {
             if (i == parts.len) return;
             const p = parts[i];
-            self.loop(p.channel, p.notes, bpm, p.volume);
-            self.armAll(parts, i + 1, bpm);
+            if (rep == p.from_rep) {
+                self.armCore(p.channel, p.notes, bpm, p.volume);
+            }
+            self.armRep(parts, i + 1, rep, bpm);
+        }
+
+        /// Comptime-recursive stop for the parts whose `to_rep` equals `rep`.
+        /// `to_rep == 0` means "play until the song ends".
+        fn stopRep(self: *Self, comptime parts: anytype, comptime i: usize, rep: u8) void {
+            if (i == parts.len) return;
+            const p = parts[i];
+            if (p.to_rep != 0 and p.to_rep == rep) {
+                self.music[@intFromEnum(p.channel)].active = false;
+                psgWriteVolume(p.channel, 0);
+            }
+            self.stopRep(parts, i + 1, rep);
+        }
+
+        /// Build a runtime callable that transitions the song to `rep`: stop the
+        /// parts that just ended, then arm the parts that begin now.
+        fn repAdvance(comptime parts: anytype) *const fn (*Self, u8, u8) void {
+            return &struct {
+                fn run(self: *Self, rep: u8, bpm: u8) void {
+                    self.stopRep(parts, 0, rep - 1);
+                    self.armRep(parts, 0, rep, bpm);
+                }
+            }.run;
         }
 
         /// Write the step at a track's current index to its channel: a tone note
         /// (period + volume) or a percussive drum hit (noise volume burst).
         fn emitNote(_: *Self, channel: Channel, t: *Track) void {
             const v = t.notes[t.index];
-            if (v >= drum_kick) {
-                // Drum hit: noise is already enabled on this channel (mixer set by
-                // playSong) and R6 is shared; just raise the volume. stepMusic
-                // drops it back to 0 after `stepOnTicks` for a crude percussive decay.
-                psgWriteVolume(channel, t.volume);
-            } else {
+            // NOTE: tone path first with `v < drum_kick` — the m68k backend swaps
+            // the branch targets of `v >= drum_kick` (verified miscompile in the
+            // shipped binary: tones got volume-only writes, drums got tone periods).
+            if (v < drum_kick) {
                 const period = v & 0x0FFF;
                 if (period == 0) {
                     psgWriteVolume(channel, 0);
@@ -1171,53 +1344,77 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
                     psgWritePeriod(channel, period);
                     psgWriteVolume(channel, t.volume);
                 }
+            } else {
+                // Drum hit: noise is already enabled on this channel (mixer set by
+                // playSong) and R6 is shared; just raise the volume. stepMusic
+                // drops it back to 0 after `stepOnTicks` for a crude percussive decay.
+                psgWriteVolume(channel, t.volume);
             }
         }
 
         /// True while any track is active (drives the run-loop poll).
         fn anyMusicActive(self: *Self) bool {
-            for (&self.music) |*t| {
-                if (t.active) return true;
-            }
-            return false;
+            // Explicit channels: the m68k backend drops the running pointer in
+            // `for (&self.music) |*t|`.
+            return self.music[0].active or self.music[1].active or self.music[2].active;
         }
 
         /// Advance every active track by `elapsed` ms, stepping the ones due.
         /// Each step sounds for its own duration, then goes silent for the
         /// gate, so notes/drum hits don't bleed into each other.
+        ///
+        /// Manually unrolled over the three channels: the m68k backend drops
+        /// the running track pointer in `for (&self.music, 0..) |*t, ch|`, so
+        /// every iteration stepped channel A only (channel B/C stayed armed but
+        /// never gated). `comptime ch` turns each call into fixed-offset field
+        /// accesses through `self`.
         fn stepMusic(self: *Self, elapsed: u16) void {
-            for (&self.music, 0..) |*t, ch| {
-                if (!t.active) continue;
-                if (t.remaining > elapsed) {
-                    t.remaining -= elapsed;
-                    continue;
-                }
-                const chan: Channel = @enumFromInt(@as(u8, @intCast(ch)));
-                if (t.gate_on) {
-                    // Gate finished — sound this step.
-                    t.gate_on = false;
-                    t.remaining = stepOnTicks(t);
-                    self.emitNote(chan, t);
-                } else {
-                    // Step finished — silence and begin the gate.
-                    psgWriteVolume(chan, 0);
-                    const gate = stepTotalTicks(t) - stepOnTicks(t);
-                    t.index += 1;
-                    if (t.index >= t.count) {
-                        if (t.looping) {
-                            t.index = 0;
-                            t.gate_on = true;
-                            t.remaining = gate;
-                        } else {
-                            psgWriteVolume(chan, 0);
-                            t.active = false;
-                        }
-                    } else {
-                        t.gate_on = true;
-                        t.remaining = gate;
-                    }
+            var rep_wrapped = self.stepTrack(0, elapsed);
+            rep_wrapped = self.stepTrack(1, elapsed) or rep_wrapped;
+            rep_wrapped = self.stepTrack(2, elapsed) or rep_wrapped;
+            if (rep_wrapped) {
+                self.song_rep += 1;
+                if (self.song_advancer) |adv| {
+                    adv(self, self.song_rep, self.song_bpm);
                 }
             }
+        }
+
+        /// Step one channel's track. Returns true when channel A's loop wraps
+        /// (drives the song rep counter).
+        fn stepTrack(self: *Self, comptime ch: usize, elapsed: u16) bool {
+            const chan: Channel = @enumFromInt(@as(u8, @intCast(ch)));
+            const t = &self.music[ch];
+            if (!t.active) return false;
+            if (t.remaining > elapsed) {
+                t.remaining -= elapsed;
+                return false;
+            }
+            if (t.gate_on) {
+                // Gate finished — sound this step.
+                t.gate_on = false;
+                t.remaining = stepOnTicks(t);
+                self.emitNote(chan, t);
+                return false;
+            }
+            // Step finished — silence and begin the gate.
+            psgWriteVolume(chan, 0);
+            const gate = stepTotalTicks(t) - stepOnTicks(t);
+            t.index += 1;
+            if (t.index >= t.count) {
+                if (t.looping) {
+                    t.index = 0;
+                    t.gate_on = true;
+                    t.remaining = gate;
+                    return ch == 0;
+                }
+                psgWriteVolume(chan, 0);
+                t.active = false;
+                return false;
+            }
+            t.gate_on = true;
+            t.remaining = gate;
+            return false;
         }
 
         /// `appl_exit` — release the application from the AES.
@@ -1295,7 +1492,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             grafMouse(GrafMouse.arrow);
             psgInit();
 
-            var last_ticks: u32 = xbiosGetTime();
+            var last_ticks: u32 = hz200();
             while (true) {
                 if (self.view_count == 0) return;
 
@@ -1310,7 +1507,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
                     EventMask.button | EventMask.mesag;
                 evntMulti(events, 1, poll, &msg, &ev);
 
-                const now = xbiosGetTime();
+                const now = hz200();
                 var ticks: u16 = @intCast(now -% last_ticks);
                 last_ticks = now;
                 if (ticks == 0) ticks = poll_ms / 5; // timer not advanced: use full poll

@@ -51,9 +51,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const timer = b.createModule(.{
+        .root_source_file = b.path("src/timer_test.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+
     linkToPrg(b, "HELLO", compileObject(b, "HELLO", welcome));
     linkToPrg(b, "WINDOW", compileObject(b, "WINDOW", window));
     linkToPrg(b, "DAF", compileObject(b, "DAF", daf));
+    linkToPrg(b, "TIMER", compileObject(b, "TIMER", timer));
 }
 
 /// Compile a module to a relocatable m68k ELF object with `_start` as the

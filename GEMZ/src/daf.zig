@@ -24,8 +24,8 @@ const mussoliniSong = [_]gemz.Part{
     .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 1, .to_rep = 4 },
     .{ .channel = .A, .notes = gemz.transpose(mussolini_notes, -4), .volume = 15, .from_rep = 5, .to_rep = 6 },
     .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 7, .to_rep = 8 },
-    .{ .channel = .A, .notes = gemz.transpose(mussolini_notes, 2), .volume = 15, .from_rep = 9, .to_rep = 10 },
-    .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 11, .to_rep = 12 },
+    .{ .channel = .A, .notes = gemz.transpose(mussolini_notes, 2), .volume = 15, .from_rep = 9, .to_rep = 9 },
+    .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 10, .to_rep = 12 },
     // Den Drum Kick starts on the 3rd rep
     .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . k", .volume = 15, .from_rep = 3, .to_rep = 12 },
     // Und denn das Hat und Snare drum muss gepoken its fingerpicken in den song spielen !

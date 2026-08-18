@@ -21,15 +21,17 @@ const DAF_LOGO = gemz.BitBlk.from(&logo_daf.DAF96, .white);
 const mussoliniSong = [_]gemz.Part{
     // Das bassline
     .{ .channel = .A, .notes = "e1 b0 d2 b0, b1 b0 b0 b1, b0 b1 b0 b1, a1 b0 b1 b0", .volume = 15, .from_rep = 1, .to_rep = 12 },
+    // .{ .channel = .A, .notes = "c1 g0 bb1 g0, g1 g0 g0 g1, g0 g1 g0 g1, f0 g0 g1 g0", .volume = 15, .from_rep = 3, .to_rep = 3 },
+    // .{ .channel = .A, .notes = "e1 b0 d2 b0, b1 b0 b0 b1, b0 b1 b0 b1, a1 b0 b1 b0", .volume = 15, .from_rep = 4, .to_rep = 12 },
     // Den Drum Kick starts on the 3rd rep
     .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . .", .volume = 15, .from_rep = 3, .to_rep = 12 },
     // Und denn das Hat und Snare drum muss gepoken its fingerpicken in den song spielen !
-    // .{ .channel = .C, .notes = "h h h h s h h h h h h h s h h h", .volume = 8, .from_rep = 4, .to_rep = 12 },
+    // .{ .channel = .C, .notes = "h h h h s h h h h h h h s h h h", .volume = 8, .from_rep = 1, .to_rep = 12 },
 };
 
 fn mussolini(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Der Mussolini|DAF - Alles ist gut (1981)", " Play | Close ")) {
-        1 => app.playSong(mussoliniSong, 100),
+        1 => app.playSong(mussoliniSong, 80), // 80 bpm = 750 ms/step (calibrated: 4000/bpm in armCore)
         // 1 => app.loop(.A, "e1 b0 d2 b0   b1 b0 b0 b1   b0 b1 b0 b1   a1 b0 b1 b0", 100, 15),
         else => {},
     }
@@ -48,7 +50,7 @@ fn rauber(app: *MyApp) bool {
 
 fn verschwende(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Verschwende deine Jugend|DAF - Alles ist gut (1981)", " Play | Close ")) {
-        1 => app.loop(.A, "bb3 bb3 c3 g3 c3 c3 bb3 c3 g3 g3 bb3 eb3 bb3 bb3 g3 bb3", 130, 15),
+        1 => app.loop(.A, "bb3- c3 g3 c3- bb3 c3 g3- bb3 eb3 bb3- g3 bb3", 130, 15),
         else => {},
     }
     return true;
@@ -56,7 +58,7 @@ fn verschwende(app: *MyApp) bool {
 
 fn liebe(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Liebe aus dem ersten Blick|DAF - Fur immer (1982)", " Play | Close ")) {
-        1 => app.loop(.A, "a2 a1 e2 a1 f2 a1 e2 a1 d2 a1 e2 a1 c2 a1 b1 e1", 120, 15),
+        1 => app.loop(.A, "e1- e2- g1- e2- a1- e2- g1- e1-", 120, 15),
         else => {},
     }
     return true;
@@ -94,7 +96,7 @@ pub fn main() !void {
         .kind = .{ .name = true, .closer = true, .mover = true },
         .title = "Deutsch Amerikanische Freundschaft",
         .x = 40,
-        .y = 40,
+        .y = 20,
         .w = 320,
         .h = 380,
     }, &.{

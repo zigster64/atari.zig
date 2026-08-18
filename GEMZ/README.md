@@ -8,7 +8,8 @@ in normal Zig.
 It is designed to be a **standalone dependency** — drop it into your own
 project's `build.zig`, target `m68k-freestanding-none`, and import `gemz`.
 
-## LLM Disclosure
+## LLM Disclosure [brain-rot.jpg]
+
 
 The ideas and inspiration behind GEMZ are based on decades of old skool good fun experimentation and hacking.
 

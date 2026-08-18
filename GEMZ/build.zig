@@ -57,10 +57,20 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
     });
 
+    const counter = b.createModule(.{
+        .root_source_file = b.path("src/counter.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .imports = &.{
+            .{ .name = "gemz", .module = gemz },
+        },
+    });
+
     linkToPrg(b, "HELLO", compileObject(b, "HELLO", welcome));
     linkToPrg(b, "WINDOW", compileObject(b, "WINDOW", window));
     linkToPrg(b, "DAF", compileObject(b, "DAF", daf));
     linkToPrg(b, "TIMER", compileObject(b, "TIMER", timer));
+    linkToPrg(b, "COUNTER", compileObject(b, "COUNTER", counter));
 }
 
 /// Compile a module to a relocatable m68k ELF object with `_start` as the

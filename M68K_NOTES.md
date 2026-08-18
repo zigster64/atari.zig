@@ -133,15 +133,14 @@ Fix — avoid runtime byte stores into arrays. Use a scalar accumulator and writ
 once, or make the index comptime. (`songMixer` was rewritten from `tone[ci] = …`
 to a scalar `mixer &= ~(1 << bit)` fold.)
 
-### 5. No `u32 * u32` (no `__mulsi3` with `-fno-compiler-rt`)
+### 5. `u32 * u32` (resolved: `__mulsi3` is now provided)
 
-```zig
-// AVOID
-const x: u32 = a * b;
-```
+Originally a 32-bit multiply failed to link because `-fno-compiler-rt` left
+`__mulsi3` undefined. GEMZ now ships a 68000-safe shift-and-add `__mulsi3`
+(`export fn __mulsi3(a: u32, b: u32) u32`), so `u32 * u32` links and works.
 
-Fix — use shifts for doubling/halving. Our frequency/period work is all
-`<< 1` / `>> 1` / `<< dashes` for exactly this reason.
+It is still a runtime helper call, not a hardware multiply, so keep using
+shifts for the hot doubling/halving paths (`<< 1` / `>> 1`) where it matters.
 
 ### 6. Comptime recursion + `inline for` over a struct array → dead code
 
@@ -152,6 +151,79 @@ apply function was never called.
 Fix — keep comptime recursion simple (the current `armRep` / `stopRep` form
 works), and prefer explicit calls over `inline for` when struct-field stores are
 involved. Disassemble to confirm the code is actually present.
+
+### 7. Byte store to a **global** buffer → illegal PC-relative destination
+
+```zig
+// BROKEN (compiles, then bus-errors / corrupts memory)
+var buf: [6]u8 = ...;
+var ptr: *[6]u8 = undefined;   // even a runtime-loaded pointer
+fn write() void {
+    const b = ptr;             // LLVM folds this back to &buf
+    b[0] = 'x';                // and emits: move.b Dn,(d16,PC)
+}
+```
+
+`move.b Dn,(d16,PC)` is not a legal m68k MOVE destination (PC-relative
+addressing is read-only). The backend still emits it for byte/word/long stores
+to a global symbol, even when the address arrives through a runtime pointer or a
+`@volatileCast` load — LLVM constant-folds the pointer back to the global.
+
+The same bug also hits **immediate stores**: `move.{b,w,l} #imm, global` is
+misencoded as the PC-relative form. The verified example is `0x31FC → 0x35FC`
+(`move.w #0,(xxx).W` became `move.w -(sp),(d16,PC)`), which crashed
+`counter.zig` at startup because `main`'s `count = 0` executed the illegal
+instruction immediately.
+
+Detection: the broken opcode families are `0x15C0-0x15FF` (byte),
+`0x35C0-0x35FF` (word), `0x25C0-0x25FF` (long) — the destination mode nibble is
+`c-f`, i.e. `move.{b,w,l} …, (d16,PC)`:
+
+```sh
+m68k-elf-objdump -b binary -m m68k --adjust-vma=0 -D zig-out/atari/MYAPP.PRG \
+  | grep -cE '\.short 0x(15|25|35)[c-f][0-9a-f]'
+# want 0
+```
+
+Note: an earlier pattern (`0x(15c|35c|25c)`) is **wrong** — it only matches the
+`c0-cf` sub-range and missed `0x35fc`, the exact encoding that crashed the
+counter. Also, object-tree data in `.rodata` can contain these byte patterns as
+ordinary data (e.g. `0x0015` = `G_TEXT`), so scope the grep to the **text
+section**: text starts at file offset 28 and its length is the big-endian
+32-bit word at PRG offset 2. Then:
+
+```sh
+TEXT_LEN=$((16#$(xxd -p -s 2 -l 4 -r zig-out/atari/MYAPP.PRG | xxd -p)))
+xxd -p -s 28 -l $TEXT_LEN zig-out/atari/MYAPP.PRG > /tmp/text.bin
+m68k-elf-objdump -b binary -m m68k --adjust-vma=0 -D /tmp/text.bin \
+  | grep -cE '\.short 0x(15|25|35)[c-f][0-9a-f]'
+# want 0
+```
+
+For reference, GNU `m68k-elf-as` encodes a valid byte store as `1543 0f86`
+(`move.b %d3,(0x0f86,%a2)`); the backend's broken form is `15c3 ...` — bit 7 of
+the first word turns the destination mode `101` (`(d16,An)`) into `111`
+(`(d16,PC)`).
+
+Fix — write the bytes through **inline assembly** so the backend cannot
+constant-fold the destination (`gemz.storeByte` / `gemz.storeWord`):
+
+```zig
+inline fn storeByte(dest: usize, value: u8) void {
+    asm volatile (
+        \\move.l %[dest], %%a0
+        \\move.b %[value], (%%a0)
+        :
+        : [dest] "d" (dest),
+          [value] "d" (value),
+        : .{ .memory = true, .a0 = true }
+    );
+}
+```
+
+This is how `counter.zig` writes the live number into its global TEDINFO text
+buffer. A `@volatileCast(&ptr).*` load alone is **not** enough — it still gets
+folded. Verify with the grep above after every change.
 
 ---
 

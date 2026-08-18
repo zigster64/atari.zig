@@ -35,7 +35,6 @@ const mussoliniSong = [_]gemz.Part{
 fn mussolini(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Der Mussolini|DAF - Alles ist gut (1981)", " Play | Close ")) {
         1 => app.playSong(mussoliniSong, 90), // 80 bpm = 750 ms/step (calibrated: 4000/bpm in armCore)
-        // 1 => app.loop(.A, "e1 b0 d2 b0   b1 b0 b0 b1   b0 b1 b0 b1   a1 b0 b1 b0", 100, 15),
         else => {},
     }
     return true;
@@ -67,9 +66,14 @@ fn liebe(app: *MyApp) bool {
     return true;
 }
 
+const satoSong = [_]gemz.Part{
+    .{ .channel = .A, .notes = "a1 . a1 c2  a1 . g1 a1  a1 . a1 f1  g1 . e1 g1", .volume = 15, .from_rep = 1, .to_rep = 16 },
+    .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . .", .volume = 15, .from_rep = 2, .to_rep = 16 },
+    .{ .channel = .C, .notes = ". . h . s . h . . . h . s . h .", .volume = 15, .from_rep = 3, .to_rep = 16 },
+};
 fn sato(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Sato Sato|DAF - Alles ist gut (1981)", " Play | Close ")) {
-        1 => app.loop(.A, "e1 e1 b0 e1 d2 e1 b0 e1 e1 e1 b0 e1 a1 e1 b0 e1", 124, 15),
+        1 => app.playSong(satoSong, 90),
         else => {},
     }
     return true;

@@ -120,18 +120,32 @@ if (v < drum_kick) { tone path } else { drum path }
 Verified marker: correct dispatch shows `subw #-16` (i.e. `v - 0xFFF0`), not
 `subw #-17`.
 
-### 4. Indexed byte store can drop the index register
+### 4. Indexed byte access to a **local/stack array** can drop the index register
 
 ```zig
-// RISKY
-arr[i] = some_u8;
+// RISKY (read OR write)
+var digits: [5]u8 = undefined;
+digits[i] = c;        // store can drop `i`
+const c = digits[i];  // read can drop `i` too
 ```
 
-Symptom: the store can lose the `i` register and write the wrong address.
+Symptom: every access touches the same fixed slot (e.g. `sp+2`/`sp+3`) instead of
+`base + i`. This bit `todo.zig` in `writeDec` (`digits[i]` read) and `loadDb`
+(`buf[i]` reads), producing garbled status text and item data.
 
-Fix — avoid runtime byte stores into arrays. Use a scalar accumulator and write
-once, or make the index comptime. (`songMixer` was rewritten from `tone[ci] = …`
-to a scalar `mixer &= ~(1 << bit)` fold.)
+Fix — use a `[*]u8` many-pointer and pointer arithmetic, never `arr[i]`:
+
+```zig
+var p: [*]u8 = &digits;
+p[0] = c;   // write
+p += 1;
+// read: p[0], then p += 1
+```
+
+Slices (`s[i]` on a `[]const u8`) appear to be safe (the pointer+index form),
+but a stack array (`arr[i]` on a `[N]u8`) is not. Prefer the pointer walk for
+both. (`songMixer` was also rewritten from `tone[ci] = …` to a scalar
+`mixer &= ~(1 << bit)` fold.)
 
 ### 5. `u32 * u32` (resolved: `__mulsi3` is now provided)
 
@@ -224,6 +238,69 @@ inline fn storeByte(dest: usize, value: u8) void {
 This is how `counter.zig` writes the live number into its global TEDINFO text
 buffer. A `@volatileCast(&ptr).*` load alone is **not** enough — it still gets
 folded. Verify with the grep above after every change.
+
+### 8. Global compare → illegal `cmpi.{b,w,l} #imm,(d16,PC)`
+
+```zig
+// BROKEN (compiles, then "Illegal Instruction")
+var count: u16 = 0;
+fn f() void {
+    if (count == 0) return;   // lowered to: cmpi.w #0,(d16,PC)
+}
+```
+
+The m68k `CMPI` instruction does **not** allow PC-relative addressing for its
+effective address (it needs Dn, (An), (An)+, -(An), (d16,An), (d8,An,Xn),
+(xxx).W or (xxx).L). The backend emits `cmpi.w #imm,(d16,PC)` for a direct
+compare against a mutable global, which is an illegal instruction on a 68000.
+
+Detection: objdump shows `.short 0x0c3a` (byte), `.short 0x0c7a` (word) or
+`.short 0x0cba` (long) — the `CMPI` + `(d16,PC)` opcodes (also the
+`(d8,PC,Xn)`/`#imm` variants `0x…3b`/`0x…3c`):
+
+```sh
+m68k-elf-objdump -b binary -m m68k --adjust-vma=0 -D /tmp/text.bin \
+  | grep -cE '\.short 0x0c(3|7|b)[abc]'
+# want 0
+```
+
+Fix — force the global into a register before comparing. A `noinline` getter
+works and survives optimization:
+
+```zig
+noinline fn getCount() u16 { return count; }   // -> move.w (d16,PC),d0 ; rts
+fn f() void {
+    if (getCount() == 0) return;               // -> cmp.w #0,d0 (legal)
+}
+```
+
+This bit `todo.zig` in `clampScroll` (`if (item_count == 0)`), which is why the
+app crashed with an illegal instruction after `loadDb`.
+
+---
+
+## GEMDOS trap #1 convention (not a backend bug, but a trap that's easy to get wrong)
+
+GEMDOS (`trap #1`) reads the **function opcode from the stack**, not from `d0`:
+
+```zig
+// Correct (matches toslibc's trap_opcode and cconws):
+asm volatile (
+    \\move.l %[name], -(%%sp)   // args pushed right-to-left
+    \\move.w %[mode], -(%%sp)
+    \\move.w #0x3d, -(%%sp)    // opcode pushed LAST (on top)
+    \\trap #1
+    \\lea 8(%%sp), %%sp        // clean args + opcode word
+    :
+    : [name] "d" (@intFromPtr(name)), [mode] "d" (mode),
+    : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
+);
+```
+
+Putting the opcode in `d0` (the XBIOS/timer_test-style mistake) silently
+dispatches the *wrong* function — `fopen`'s `0x3D` ended up executing as
+`Cconout` (`0x02`) because GEMDOS read the opcode word from the stack top. XBIOS
+(`trap #14`) also reads its opcode from the stack; only the trap number differs.
 
 ---
 

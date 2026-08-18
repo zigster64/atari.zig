@@ -92,6 +92,21 @@ fn setScroll(v: u16) void {
     gemz.storeWord(@intFromPtr(&scroll), v);
 }
 
+/// Read the mutable globals through `noinline` functions so the backend loads
+/// them into a register (`move.w (d16,PC),dN` — legal) rather than emitting
+/// the illegal `cmpi.w #imm,(d16,PC)` direct-compare-on-memory form.
+noinline fn getCount() u16 {
+    return item_count;
+}
+
+noinline fn getCursor() u16 {
+    return cursor;
+}
+
+noinline fn getScroll() u16 {
+    return scroll;
+}
+
 /// Address of `items[idx]`, walked with pointer arithmetic so the m68k backend
 /// never has to multiply a 32-bit index by `sizeof(Item)`.
 fn itemAddr(idx: u16) usize {
@@ -160,12 +175,15 @@ fn writeDec(dst: usize, off: usize, v: u16) usize {
 
 /// Keep the cursor inside the visible window.
 fn clampScroll() void {
-    if (item_count == 0) {
+    const count = getCount();
+    const cur = getCursor();
+    const scr = getScroll();
+    if (count == 0) {
         setScroll(0);
         return;
     }
-    if (cursor < scroll) setScroll(cursor);
-    if (cursor > scroll + VISIBLE - 1) setScroll(cursor - (VISIBLE - 1));
+    if (cur < scr) setScroll(cur);
+    if (cur > scr + VISIBLE - 1) setScroll(cur - (VISIBLE - 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -173,20 +191,11 @@ fn clampScroll() void {
 // ---------------------------------------------------------------------------
 
 fn loadDb() void {
-    gemz.dbg("todo: loadDb enter");
     const h = gemz.fopen("TODO.db", 0);
-    gemz.dbg("todo: fopen done");
-    gemz.dbgInt(h);
-    if (h < 0) {
-        gemz.dbg("todo: h<0 (no file)");
-        return;
-    } else {
-        gemz.dbg("todo: h>=0 (opened)");
-    }
+    if (h < 0) return;
 
     var buf: [FILE_CAP]u8 = undefined;
     const n = gemz.fread(h, &buf, FILE_CAP);
-    gemz.dbg("todo: fread done");
     _ = gemz.fclose(h);
     if (n < 1) return;
 
@@ -195,7 +204,7 @@ fn loadDb() void {
     var i: usize = 0;
     const total: usize = @intCast(n);
 
-    while (i < total and item_count < MAX_ITEMS) {
+    while (i < total and getCount() < MAX_ITEMS) {
         const sentinel = buf[i];
         i += 1;
 
@@ -210,7 +219,7 @@ fn loadDb() void {
             }
             gemz.storeByte(addr + 1 + t, 0);
             wp += 1;
-            setCount(item_count + 1);
+            setCount(getCount() + 1);
         }
 
         // Skip the rest of this line (whether or not it was a valid item).
@@ -225,7 +234,7 @@ fn saveDb() void {
     var ip: [*]Item = &items;
     var i: usize = 0;
 
-    while (i < item_count) : (i += 1) {
+    while (i < getCount()) : (i += 1) {
         p[0] = ip[0].done;
         p += 1;
         var t: usize = 0;
@@ -256,14 +265,14 @@ fn render(app: *MyApp) void {
     var tp: [*]gemz.TedInfo = &line_ted;
     var ip: [*]Item = &items;
     var si: u16 = 0;
-    while (si < scroll) : (si += 1) ip += 1;
+    while (si < getScroll()) : (si += 1) ip += 1;
 
     var row: usize = 0;
     while (row < VISIBLE) : (row += 1) {
         const base = @intFromPtr(lp);
-        if (si < item_count) {
+        if (si < getCount()) {
             const done = ip[0].done == 'D';
-            const selected = si == cursor;
+            const selected = si == getCursor();
 
             gemz.storeByte(base + 0, if (selected) '>' else ' ');
             gemz.storeByte(base + 1, '[');
@@ -294,7 +303,7 @@ fn render(app: *MyApp) void {
     var dp: [*]Item = &items;
     var done: u16 = 0;
     var i: usize = 0;
-    while (i < item_count) : (i += 1) {
+    while (i < getCount()) : (i += 1) {
         if (dp[0].done == 'D') done += 1;
         dp += 1;
     }
@@ -302,11 +311,11 @@ fn render(app: *MyApp) void {
     const sb = @intFromPtr(&status_buf);
     var off: usize = 0;
     off = writeText(sb, off, "TASKS ");
-    off = writeDec(sb, off, item_count);
+    off = writeDec(sb, off, getCount());
     off = writeText(sb, off, "   DONE ");
     off = writeDec(sb, off, done);
     off = writeText(sb, off, "   SEL ");
-    off = writeDec(sb, off, if (item_count == 0) 0 else cursor + 1);
+    off = writeDec(sb, off, if (getCount() == 0) 0 else getCursor() + 1);
     gemz.storeByte(sb + off, 0);
 
     app.redraw();
@@ -317,7 +326,7 @@ fn render(app: *MyApp) void {
 // ---------------------------------------------------------------------------
 
 fn addClicked(app: *MyApp) bool {
-    if (item_count > MAX_ITEMS - 1) {
+    if (getCount() > MAX_ITEMS - 1) {
         app.form_alert(.default_button, "TODO list is full");
         return true;
     }
@@ -326,7 +335,7 @@ fn addClicked(app: *MyApp) bool {
     input[0] = 0;
     if (!gemz.formInput("New task:", &input, TEXT_LEN)) return true;
 
-    const idx = item_count;
+    const idx = getCount();
     gemz.storeByte(itemAddr(idx) + 0, 'T');
     var t: usize = 0;
     while (t < TEXT_LEN - 1 and input[t] != 0) : (t += 1) {
@@ -343,8 +352,8 @@ fn addClicked(app: *MyApp) bool {
 }
 
 fn toggleClicked(app: *MyApp) bool {
-    if (item_count == 0) return true;
-    const idx = cursor;
+    if (getCount() == 0) return true;
+    const idx = getCursor();
     const done = itemDone(idx);
     gemz.storeByte(itemAddr(idx) + 0, if (done == 'D') 'T' else 'D');
     render(app);
@@ -353,17 +362,17 @@ fn toggleClicked(app: *MyApp) bool {
 }
 
 fn deleteClicked(app: *MyApp) bool {
-    if (item_count == 0) return true;
-    const idx = cursor;
+    if (getCount() == 0) return true;
+    const idx = getCursor();
     var i: u16 = idx;
-    while (i + 1 < item_count) : (i += 1) {
+    while (i + 1 < getCount()) : (i += 1) {
         copyItem(i, i + 1);
     }
-    setCount(item_count - 1);
-    if (item_count == 0) {
+    setCount(getCount() - 1);
+    if (getCount() == 0) {
         setCursor(0);
-    } else if (cursor > item_count - 1) {
-        setCursor(item_count - 1);
+    } else if (getCursor() > getCount() - 1) {
+        setCursor(getCount() - 1);
     }
     clampScroll();
     render(app);
@@ -378,15 +387,15 @@ fn saveClicked(app: *MyApp) bool {
 }
 
 fn upClicked(app: *MyApp) bool {
-    if (cursor > 0) setCursor(cursor - 1);
+    if (getCursor() > 0) setCursor(getCursor() - 1);
     clampScroll();
     render(app);
     return true;
 }
 
 fn downClicked(app: *MyApp) bool {
-    if (item_count == 0) return true;
-    if (cursor < item_count - 1) setCursor(cursor + 1);
+    if (getCount() == 0) return true;
+    if (getCursor() < getCount() - 1) setCursor(getCursor() + 1);
     clampScroll();
     render(app);
     return true;
@@ -405,16 +414,12 @@ export fn _start() callconv(.c) noreturn {
 }
 
 pub fn main() !void {
-    gemz.dbg("todo: start");
     var app = try MyApp.init();
     defer app.exit();
-    gemz.dbg("todo: init ok");
 
     loadDb();
-    gemz.dbg("todo: loadDb returned");
     setCursor(0);
     setScroll(0);
-    gemz.dbg("todo: load ok");
 
     const nodes = comptime blk: {
         var arr: [TOTAL]MyApp.Node = undefined;
@@ -448,10 +453,7 @@ pub fn main() !void {
         .w = WIN_W,
         .h = WIN_H,
     }, &nodes);
-    gemz.dbg("todo: open ok");
 
     render(&app);
-    gemz.dbg("todo: render ok");
     app.run();
-    gemz.dbg("todo: run returned");
 }

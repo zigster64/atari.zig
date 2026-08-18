@@ -550,6 +550,11 @@ fragile. These are the failure modes that have actually bitten this project.
    **text section** contains no `move.{b,w,l} …,(d16,PC)` opcodes
    (`0x15/25/35` `c0-ff` family) — see `M68K_NOTES.md` for the exact grep.
 
+9. **Do not compare a mutable global directly** (`if (count == 0)`). The backend
+   can lower it to `cmpi.w #0,(d16,PC)` — an illegal instruction, because CMPI
+   has no PC-relative form. Load the global into a register first, e.g. via a
+   `noinline` getter, and compare the register.
+
 The rule of thumb: **don't carry a runtime pointer/offset around a loop; prefer
 comptime-fixed addresses.** After any change that touches these shapes,
 disassemble the `.PRG` and confirm the generated code actually does what the

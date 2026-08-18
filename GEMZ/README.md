@@ -1,4 +1,4 @@
-![Atari_1040STf][Atari_1040STf.png]
+![Atari_1040STf](Atari_1040STf.png)
 
 # GEMZ Zig Library for Atari ST development
 

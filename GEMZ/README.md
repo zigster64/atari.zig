@@ -1,4 +1,6 @@
-# GEMZ
+![Atari_1040STf][Atari_1040STf.png]
+
+# GEMZ Zig Library for Atari ST development
 
 GEMZ is a Zig library for building Atari ST applications. It wraps GEM
 (AES + VDI) and the YM2149 (PSG) in idiomatic Zig types and a small set of
@@ -8,8 +10,7 @@ in normal Zig.
 It is designed to be a **standalone dependency** — drop it into your own
 project's `build.zig`, target `m68k-freestanding-none`, and import `gemz`.
 
-## LLM Disclosure ![brain-rot alert](brain-rot.png)
-
+## ![brain-rot alert](brain-rot.png) LLM Disclosure
 
 The ideas and inspiration behind GEMZ are based on decades of old skool good fun experimentation and hacking.
 

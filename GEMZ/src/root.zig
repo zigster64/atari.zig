@@ -279,6 +279,153 @@ pub fn dbg(comptime msg: []const u8) void {
 }
 
 // ---------------------------------------------------------------------------
+// Safe stores into mutable global buffers
+// ---------------------------------------------------------------------------
+
+/// Store a byte at `dest` through an address register.
+///
+/// The m68k backend mis-lowers a store to a mutable global as
+/// `move.b Dn,(d16,PC)` — PC-relative addressing is read-only, so this is an
+/// illegal instruction. Doing the store in inline asm forces it through `a0`
+/// and cannot be constant-folded. Use this (or `storeWord`) for writes into
+/// module-level buffers such as TEDINFO text/colour fields.
+pub inline fn storeByte(dest: usize, value: u8) void {
+    asm volatile (
+        \\move.l %[dest], %%a0
+        \\move.b %[value], (%%a0)
+        :
+        : [dest] "d" (dest),
+          [value] "d" (value),
+        : .{ .memory = true, .a0 = true }
+    );
+}
+
+/// Word variant of `storeByte`. `dest` must be even-aligned.
+pub inline fn storeWord(dest: usize, value: u16) void {
+    asm volatile (
+        \\move.l %[dest], %%a0
+        \\move.w %[value], (%%a0)
+        :
+        : [dest] "d" (dest),
+          [value] "d" (value),
+        : .{ .memory = true, .a0 = true }
+    );
+}
+
+/// Copy `len` bytes from `src` into a stable/global buffer. Every byte goes
+/// through `storeByte` so LLVM cannot constant-fold the destination into an
+/// illegal PC-relative `move.b`. `len` is comptime so the copy fully unrolls
+/// and `src` is walked with a many-pointer rather than a runtime index.
+pub fn storeBytes(dest: usize, src: [*]const u8, comptime len: usize) void {
+    var d = dest;
+    var s = src;
+    inline for (0..len) |_| {
+        storeByte(d, s[0]);
+        d += 1;
+        s += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GEMDOS file I/O (trap #1)
+// ---------------------------------------------------------------------------
+
+/// GEMDOS Fopen — open an existing file. `mode`: 0 = read, 1 = write,
+/// 2 = read/write. Returns a file handle (>= 0) or a negative GEMDOS error.
+pub fn fopen(name: [*:0]const u8, mode: u16) i32 {
+    var r: i32 = 0;
+    asm volatile (
+        \\move.w %[mode], -(%%sp)
+        \\move.l %[name], -(%%sp)
+        \\move.w #0x3d, -(%%sp)
+        \\trap #1
+        \\lea 8(%%sp), %%sp
+        \\move.l %%d0, %[r]
+        : [r] "=m" (r),
+        : [name] "d" (@intFromPtr(name)),
+          [mode] "d" (mode),
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
+    );
+    return r;
+}
+
+/// GEMDOS Fcreate — create/truncate a file for writing. Returns a handle or a
+/// negative GEMDOS error.
+pub fn fcreate(name: [*:0]const u8) i32 {
+    var r: i32 = 0;
+    asm volatile (
+        \\move.w #0, -(%%sp)
+        \\move.l %[name], -(%%sp)
+        \\move.w #0x3c, -(%%sp)
+        \\trap #1
+        \\lea 8(%%sp), %%sp
+        \\move.l %%d0, %[r]
+        : [r] "=m" (r),
+        : [name] "d" (@intFromPtr(name)),
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
+    );
+    return r;
+}
+
+/// GEMDOS Fread — read up to `len` bytes into `buf`. Returns bytes read (>= 0)
+/// or a negative GEMDOS error.
+pub fn fread(handle: i32, buf: [*]u8, len: u32) i32 {
+    var r: i32 = 0;
+    asm volatile (
+        \\move.l %[buf], -(%%sp)
+        \\move.l %[len], -(%%sp)
+        \\move.w %[handle], -(%%sp)
+        \\move.w #0x3f, -(%%sp)
+        \\trap #1
+        \\lea 12(%%sp), %%sp
+        \\move.l %%d0, %[r]
+        : [r] "=m" (r),
+        : [handle] "d" (@as(u32, @bitCast(handle))),
+          [len] "d" (len),
+          [buf] "d" (@intFromPtr(buf)),
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
+    );
+    return r;
+}
+
+/// GEMDOS Fwrite — write `len` bytes from `buf`. Returns bytes written (>= 0)
+/// or a negative GEMDOS error.
+pub fn fwrite(handle: i32, buf: [*]const u8, len: u32) i32 {
+    var r: i32 = 0;
+    asm volatile (
+        \\move.l %[buf], -(%%sp)
+        \\move.l %[len], -(%%sp)
+        \\move.w %[handle], -(%%sp)
+        \\move.w #0x40, -(%%sp)
+        \\trap #1
+        \\lea 12(%%sp), %%sp
+        \\move.l %%d0, %[r]
+        : [r] "=m" (r),
+        : [handle] "d" (@as(u32, @bitCast(handle))),
+          [len] "d" (len),
+          [buf] "d" (@intFromPtr(buf)),
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
+    );
+    return r;
+}
+
+/// GEMDOS Fclose — close a handle. Returns 0 on success or a negative error.
+pub fn fclose(handle: i32) i32 {
+    var r: i32 = 0;
+    asm volatile (
+        \\move.w %[handle], -(%%sp)
+        \\move.w #0x3e, -(%%sp)
+        \\trap #1
+        \\lea 4(%%sp), %%sp
+        \\move.l %%d0, %[r]
+        : [r] "=m" (r),
+        : [handle] "d" (@as(u32, @bitCast(handle))),
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
+    );
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // Public GEM types
 // ---------------------------------------------------------------------------
 
@@ -428,8 +575,7 @@ fn hz200() u32 {
         \\move.l %%d0, %[result]
         : [result] "=m" (result),
         :
-        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
-    );
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true });
     return result;
 }
 
@@ -439,6 +585,16 @@ const drum_burst_ticks: u16 = 10;
 /// Noise period (R6, 0-31) for the shared noise generator; higher = lower pitch.
 /// One value for all drums for now; per-hit pitch comes later.
 const noise_period: u8 = 8;
+
+/// Hardware envelope for punchy song-mode tone notes. The YM2149 has a single
+/// shared envelope generator, so these shape every envelope-mode channel at
+/// once (currently just the song bassline). Decay length ≈
+/// `(256 * env_coarse + env_fine) * 256 / 2 MHz`; `env_coarse = 6` is ~200 ms.
+/// Smaller = snappier, larger = longer. `env_shape` 0x09 = single downward
+/// sawtooth (pluck/decay).
+const env_fine: u8 = 0x00;
+const env_coarse: u8 = 6;
+const env_shape: u8 = 0x09;
 
 /// Sentinel values stored in `notes[]` for percussive hits. Tone periods are
 /// 12-bit (<= 0x0FFF), so 0xFFF0.. are unambiguous.
@@ -454,6 +610,7 @@ pub const Track = struct {
     delay_ticks: u16 = 0, // duration of one beat, in 200 Hz ticks
     remaining: u16 = 0, // ticks until this track's next state change
     volume: u8 = 0, // 0-15
+    vol_reg: u8 = 0, // raw value written to R8/R9/R10 on a tone note (0x10 = hardware envelope)
     looping: bool = false,
     active: bool = false,
     gate_on: bool = false, // in the silence gap before the next note
@@ -730,8 +887,7 @@ fn giAccess(data: u16, reg: u16) void {
         :
         : [data] "d" (@as(u32, data)),
           [reg] "d" (@as(u32, reg)),
-        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
-    );
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true });
 }
 
 /// Write a value to a YM2149 register via XBIOS Giaccess. The register number
@@ -751,6 +907,19 @@ fn psgWritePeriod(channel: Channel, period: u16) void {
 /// Write a channel's volume (R8/R9/R10). 0-15, 0 = silent.
 fn psgWriteVolume(channel: Channel, volume: u8) void {
     psgWrite(8 + @intFromEnum(channel), volume & 0x0F);
+}
+
+/// Write a channel's volume register verbatim (bit 4 = route through the
+/// shared hardware envelope instead of the fixed 0-15 level).
+fn psgWriteVolumeRaw(channel: Channel, value: u8) void {
+    psgWrite(8 + @intFromEnum(channel), value);
+}
+
+/// Configure the shared YM2149 hardware envelope (R11/R12 = period, R13 = shape).
+fn psgSetEnvelope(fine: u8, coarse: u8, shape: u8) void {
+    psgWrite(11, fine);
+    psgWrite(12, coarse);
+    psgWrite(13, shape);
 }
 
 /// Initialise the PSG: tone on for all three channels, noise off.
@@ -833,6 +1002,31 @@ pub fn bitmap(comptime rows: []const []const u8) Bitmap {
         break :blk buf;
     };
     return .{ .data = data[0..], .w_px = w, .h_px = h };
+}
+
+// ---------------------------------------------------------------------------
+// Realtime equalizer — a scrolling 1-bit line graph rendered as a G_IMAGE.
+// ---------------------------------------------------------------------------
+
+pub const eq_w = 232; // pixels
+pub const eq_h = 12; // pixels
+pub const eq_row_bytes = (eq_w + 7) / 8;
+
+var eq_levels: [eq_w]u8 = [_]u8{0} ** eq_w;
+var eq_buf: [eq_h * eq_row_bytes]u8 = [_]u8{0} ** (eq_h * eq_row_bytes);
+
+const EQ_BITBLK = BitBlk{
+    .pdata = &eq_buf,
+    .wb = eq_row_bytes,
+    .hl = eq_h,
+    .x = 0,
+    .y = 0,
+    .color = 0, // white
+};
+
+/// Stable BITBLK pointer for the equalizer G_IMAGE node.
+pub fn eqBitBlk() *const BitBlk {
+    return &EQ_BITBLK;
 }
 
 /// A GEM object-tree node (24 bytes, layout per Atari GEM).
@@ -1065,6 +1259,94 @@ noinline fn grafMouse(mode: i16) void {
 }
 
 // ---------------------------------------------------------------------------
+// AES: modal single-line text input (form_center + form_do)
+// ---------------------------------------------------------------------------
+
+fn formCenter(tree: []Object) void {
+    const addr_in = [_]?[*]const u8{@ptrCast(tree.ptr)};
+    const args = AesArgs{
+        .int_in = null,
+        .n_int_in = 0,
+        .addr_in = &addr_in,
+        .n_addr_in = 1,
+        .n_int_out = 4,
+    };
+    _ = aesCall(.form_center, &args);
+}
+
+fn formDo(tree: []Object, editobj: i16) i16 {
+    const int_in = [_]i16{editobj};
+    const addr_in = [_]?[*]const u8{@ptrCast(tree.ptr)};
+    const args = AesArgs.from(&int_in, &addr_in, 1);
+    return aesCall(.form_do, &args);
+}
+
+/// Show a modal single-line text prompt. The user's answer is written into
+/// `buf` (at most `max_len` bytes incl. NUL) by the AES; returns true if OK
+/// was pressed. `buf` should be pre-zeroed so Cancel/empty leaves a clean
+/// string. Uses a small stack-built `form_do` dialog with a `G_FTEXT` field.
+pub fn formInput(comptime prompt: []const u8, buf: [*]u8, comptime max_len: usize) bool {
+    var prompt_ted = TedInfo{
+        .ptext = prompt.ptr,
+        .ptmplt = null,
+        .pvalid = null,
+        .font = 3,
+        .junk1 = 0,
+        .just = 0,
+        .color = textColor(.black),
+        .junk2 = 0,
+        .thickness = 1,
+        .txtlen = 0,
+        .tmplen = 0,
+    };
+    var ted = TedInfo{
+        .ptext = @ptrCast(buf),
+        .ptmplt = null,
+        .pvalid = null,
+        .font = 3,
+        .junk1 = 0,
+        .just = 0,
+        .color = textColor(.black),
+        .junk2 = 0,
+        .thickness = 1,
+        .txtlen = @intCast(max_len - 1),
+        .tmplen = 0,
+    };
+
+    var tree = [_]Object{
+        Object.box(260, 80),
+        .{ // 1: prompt label
+            .object_type = .text,
+            .spec = @ptrCast(&prompt_ted),
+            .x = 8,
+            .y = 8,
+            .w = 244,
+            .h = 16,
+        },
+        .{ // 2: editable text field
+            .object_type = .f_text,
+            .flags = .editable,
+            .spec = @ptrCast(&ted),
+            .x = 8,
+            .y = 28,
+            .w = 244,
+            .h = 20,
+        },
+        Object.button("  OK  ", 40, 54, 80, 20, .flags(&.{ .selectable, .default_, .exit })),
+        Object.button("Cancel", 140, 54, 80, 20, .flags(&.{ .selectable, .exit })),
+    };
+    tree[0].head = 1;
+    tree[0].tail = 4;
+    tree[1].next = 2;
+    tree[2].next = 3;
+    tree[3].next = 4;
+    tree[4].next = 0;
+
+    formCenter(&tree);
+    return formDo(&tree, 2) == 3;
+}
+
+// ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
 
@@ -1241,7 +1523,8 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
 
         /// Shared track arming: parse the notes, reset state, and sound the first
         /// note. Leaves the mixer untouched (the caller sets tone/noise routing).
-        fn armCore(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
+        /// `env` selects hardware-envelope note-on for tone notes (song mode).
+        fn armCore(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8, comptime env: bool) void {
             // Calibrated to the OBSERVED effective rate of the opcode-23 clock
             // (240 bpm input == ~750 ms/step, i.e. ~15 ms/tick): ticks per beat
             // = 60000 ms / (bpm × 15 ms) = 4000 / bpm. Revisit once the true
@@ -1258,6 +1541,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             t.delay_ticks = delay_ticks;
             t.remaining = stepOnTicks(t);
             t.volume = volume;
+            t.vol_reg = if (env) 0x10 else volume;
             t.looping = true;
             t.active = true;
             t.gate_on = false;
@@ -1269,7 +1553,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         pub fn play(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
             self.song_advancer = null;
             psgInit(); // simple melodies are tone-only: restore the tone mixer
-            self.armCore(channel, notes, bpm, volume);
+            self.armCore(channel, notes, bpm, volume, false);
             self.music[@intFromEnum(channel)].looping = false; // one-shot
         }
 
@@ -1278,7 +1562,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
         pub fn loop(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
             self.song_advancer = null;
             psgInit(); // simple melodies are tone-only: restore the tone mixer
-            self.armCore(channel, notes, bpm, volume);
+            self.armCore(channel, notes, bpm, volume, false);
         }
 
         /// Arrange a full song: each part plays on its channel from `from_rep` to
@@ -1289,6 +1573,10 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             self.song_advancer = repAdvance(parts);
             self.song_bpm = bpm;
             self.song_rep = 1;
+            // Configure the shared envelope before the first note-on; the YM2149
+            // powers up with R11/R12 = 0 (instant decay), which would make the
+            // first envelope-mode note inaudible.
+            psgSetEnvelope(env_fine, env_coarse, env_shape);
             self.armRep(parts, 0, 1, bpm);
             psgWrite(7, songMixer(parts));
             psgWrite(6, noise_period);
@@ -1301,7 +1589,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             if (i == parts.len) return;
             const p = parts[i];
             if (rep == p.from_rep) {
-                self.armCore(p.channel, p.notes, bpm, p.volume);
+                self.armCore(p.channel, p.notes, bpm, p.volume, !hasDrumToken(p.notes));
             }
             self.armRep(parts, i + 1, rep, bpm);
         }
@@ -1342,7 +1630,12 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
                     psgWriteVolume(channel, 0);
                 } else {
                     psgWritePeriod(channel, period);
-                    psgWriteVolume(channel, t.volume);
+                    // `vol_reg` is 0x10 for envelope-mode tone tracks (song
+                    // bassline) and the fixed 0-15 level otherwise. Writing R13
+                    // restarts the shared envelope; it is harmless on fixed-volume
+                    // channels because their volume register has bit 4 clear.
+                    psgWriteVolumeRaw(channel, t.vol_reg);
+                    psgWrite(13, env_shape);
                 }
             } else {
                 // Drum hit: noise is already enabled on this channel (mixer set by
@@ -1417,6 +1710,38 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             return false;
         }
 
+        /// Advance the equalizer line graph one column and rebuild its bitmap.
+        /// Uses channel A's current note (if sounding) to size the newest bar.
+        fn eqTick(self: *Self) void {
+            // Scroll levels left one column (memmove handles the overlap).
+            @memmove(eq_levels[0 .. eq_w - 1], eq_levels[1..eq_w]);
+
+            // Newest level from channel A's current note.
+            var lvl: u8 = 0;
+            const t = &self.music[0];
+            if (t.active and !t.gate_on) {
+                const v = t.notes[t.index];
+                if (v < drum_kick and v != 0) {
+                    const h: u8 = @intCast((v & 0x0FFF) >> 8); // smaller period = higher note
+                    lvl = if (h > 11) 1 else 12 - h;
+                }
+            }
+            eq_levels[eq_w - 1] = lvl;
+
+            // Rebuild the packed 1-bit bitmap from the levels.
+            @memset(&eq_buf, 0);
+            var c: usize = 0;
+            while (c < eq_w) : (c += 1) {
+                const col_lvl = eq_levels[c];
+                var r: u8 = 0;
+                while (r < col_lvl) : (r += 1) {
+                    const row: usize = eq_h - 1 - @as(usize, r);
+                    const byte_idx = row * eq_row_bytes + (c >> 3);
+                    eq_buf[byte_idx] |= (@as(u8, 0x80) >> @intCast(c & 7));
+                }
+            }
+        }
+
         /// `appl_exit` — release the application from the AES.
         pub fn exit(_: *Self) void {
             // Silence all PSG channels so the sound stops with the app (a
@@ -1430,10 +1755,13 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
 
         /// Stop all tracks and silence every PSG channel.
         pub fn stopMusic(self: *Self) void {
-            for (&self.music) |*t| {
-                t.active = false;
-                t.gate_on = false;
-            }
+            // Explicit channels: same m68k `for`-over-array miscompile avoidance.
+            self.music[0].active = false;
+            self.music[1].active = false;
+            self.music[2].active = false;
+            self.music[0].gate_on = false;
+            self.music[1].gate_on = false;
+            self.music[2].gate_on = false;
             psgWriteVolume(.A, 0);
             psgWriteVolume(.B, 0);
             psgWriteVolume(.C, 0);
@@ -1483,6 +1811,49 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             self.view_count += 1;
         }
 
+        /// Redraw the first open view. Convenience for apps that mutate their
+        /// own display (e.g. a counter's number) and need to repaint.
+        ///
+        /// This repaints the whole tree, which is why it visibly blanks and
+        /// redraws: every widget (including the filled buttons) is drawn again.
+        /// Prefer `redrawNode` when only one widget changed.
+        pub fn redraw(self: *Self) void {
+            if (self.view_count == 0) return;
+            const v = &self.views[0];
+            const work = v.window.workRect();
+            redrawTree(&v.window, v.treeSlice(), work.x, work.y, work.w, work.h);
+        }
+
+        /// Redraw just one node of the first view, clipped to that node's own
+        /// rectangle. This is the flicker-free path: only the changed widget is
+        /// repainted inside a `wind_update` lock, so the rest of the window is
+        /// never touched. Call it with the tree index of the widget that
+        /// changed (0 is the root/background, 1 is the first child, and so on).
+        pub fn redrawNode(self: *Self, index: usize) void {
+            if (self.view_count == 0) return;
+            const v = &self.views[0];
+            if (index >= v.node_count) return;
+
+            // objc_draw resolves a child's screen position by walking up to the
+            // root, so the root must be at the work-area origin (same trick as
+            // redrawTree). The clip is the node's own rectangle in screen coords.
+            const origin = v.window.workOrigin();
+            const obj = &v.tree[index];
+            const xc: i16 = origin.x + obj.x;
+            const yc: i16 = origin.y + obj.y;
+            const wc: i16 = obj.w;
+            const hc: i16 = obj.h;
+
+            v.tree[0].x = origin.x;
+            v.tree[0].y = origin.y;
+            windUpdate(WindUpdate.beg_update);
+            objcDraw(v.treeSlice(), @intCast(index), 0, xc, yc, wc, hc);
+            windUpdate(WindUpdate.end_update);
+            // Restore clean (0,0) tree coords for objc_find hit-testing.
+            v.tree[0].x = 0;
+            v.tree[0].y = 0;
+        }
+
         /// Run the event loop until the last window is closed.
         pub fn run(self: *Self) void {
             var msg: [16]i16 = undefined;
@@ -1514,7 +1885,17 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
 
                 if ((ev.ev & EventMask.mesag) != 0) self.handleMessage(&msg);
                 if ((ev.ev & EventMask.button) != 0) self.handleClick(ev.mx, ev.my);
-                if (playing) self.stepMusic(ticks);
+                if (playing) {
+                    self.stepMusic(ticks);
+                    // self.eqTick();
+                    // Redraw the equalizer region. Redrawing the whole tree is
+                    // fine for this small window; the AES clips to the update rect.
+                    // if (self.view_count > 0) {
+                    //     const v = &self.views[0];
+                    //     const work = v.window.workRect();
+                    //     redrawTree(&v.window, v.treeSlice(), work.x, work.y, work.w, work.h);
+                    // }
+                }
             }
         }
 
@@ -1691,6 +2072,22 @@ fn panicImpl(_: []const u8, _: ?usize) noreturn {
 
 export fn abort() noreturn {
     pterm0();
+}
+
+/// 32-bit unsigned multiply for the m68k backend. LLVM lowers `u32 * u32` to a
+/// call to compiler-rt's `__mulsi3`; with `bundle_compiler_rt = false` that
+/// symbol is normally missing, so provide a 68000-safe shift-and-add version.
+/// This removes the old "no u32 * u32" restriction for app code.
+export fn __mulsi3(a: u32, b: u32) u32 {
+    var result: u32 = 0;
+    var x = a;
+    var y = b;
+    while (y != 0) {
+        if (y & 1 != 0) result +%= x;
+        y >>= 1;
+        x <<= 1;
+    }
+    return result;
 }
 
 /// LLVM lowers struct zero-init to `memset`; compiler_rt's version uses

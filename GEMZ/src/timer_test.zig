@@ -44,9 +44,9 @@ fn pterm0() noreturn {
 fn conout(str: [*:0]const u8) void {
     asm volatile (
         \\move.l %[str], -(%%sp)
-        \\move.w #0x09, %%d0
+        \\move.w #0x09, -(%%sp)
         \\trap #1
-        \\lea 4(%%sp), %%sp
+        \\lea 6(%%sp), %%sp
         :
         : [str] "d" (@intFromPtr(str)),
         : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
@@ -61,9 +61,9 @@ fn fcreate(name: [*:0]const u8) i32 {
     asm volatile (
         \\move.w #0, -(%%sp)
         \\move.l %[name], -(%%sp)
-        \\move.w #0x3c, %%d0
+        \\move.w #0x3c, -(%%sp)
         \\trap #1
-        \\lea 6(%%sp), %%sp
+        \\lea 8(%%sp), %%sp
         \\move.l %%d0, %[r]
         : [r] "=m" (r),
         : [name] "d" (@intFromPtr(name)),
@@ -78,9 +78,9 @@ fn fwrite(handle: i32, len: u32, buf: [*]const u8) i32 {
         \\move.l %[buf], -(%%sp)
         \\move.l %[len], -(%%sp)
         \\move.w %[handle], -(%%sp)
-        \\move.w #0x40, %%d0
+        \\move.w #0x40, -(%%sp)
         \\trap #1
-        \\lea 10(%%sp), %%sp
+        \\lea 12(%%sp), %%sp
         \\move.l %%d0, %[r]
         : [r] "=m" (r),
         : [handle] "d" (@as(u32, @bitCast(handle))),
@@ -95,9 +95,9 @@ fn fclose(handle: i32) i32 {
     var r: i32 = 0;
     asm volatile (
         \\move.w %[handle], -(%%sp)
-        \\move.w #0x3e, %%d0
+        \\move.w #0x3e, -(%%sp)
         \\trap #1
-        \\lea 2(%%sp), %%sp
+        \\lea 4(%%sp), %%sp
         \\move.l %%d0, %[r]
         : [r] "=m" (r),
         : [handle] "d" (@as(u32, @bitCast(handle))),

@@ -127,10 +127,15 @@ fn itemText(idx: u16, pos: usize) u8 {
 }
 
 fn copyItem(dst: u16, src: u16) void {
-    gemz.storeByte(itemAddr(dst) + 0, itemDone(src));
+    const sa = itemAddr(src);
+    const da = itemAddr(dst);
+    const sd: [*]const u8 = @ptrFromInt(sa);
+    gemz.storeByte(da + 0, sd[0]);
+    var sp_: [*]const u8 = @ptrFromInt(sa + 1);
     var t: usize = 0;
     while (t < TEXT_LEN) : (t += 1) {
-        gemz.storeByte(itemAddr(dst) + 1 + t, itemText(src, t));
+        gemz.storeByte(da + 1 + t, sp_[0]);
+        sp_ += 1;
     }
 }
 
@@ -141,9 +146,11 @@ fn colorWord(color: gemz.Color) u16 {
 /// Write `s` into a global byte buffer starting at `dst + off`. Returns the new
 /// offset.
 fn writeText(dst: usize, off: usize, s: []const u8) usize {
+    var q: [*]const u8 = s.ptr;
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
-        gemz.storeByte(dst + off + i, s[i]);
+        gemz.storeByte(dst + off + i, q[0]);
+        q += 1;
     }
     return off + s.len;
 }
@@ -165,12 +172,14 @@ fn writeDec(dst: usize, off: usize, v: u16) usize {
         n += 1;
         x = x / 10;
     }
-    var i: usize = n;
-    while (i > 0) {
-        i -= 1;
-        gemz.storeByte(dst + off + (n - 1 - i), digits[i]);
+    // digits are least-significant first; emit back-to-front.
+    var o: usize = off;
+    while (n > 0) : (n -= 1) {
+        p -= 1;
+        gemz.storeByte(dst + o, p[0]);
+        o += 1;
     }
-    return off + n;
+    return o;
 }
 
 /// Keep the cursor inside the visible window.
@@ -201,20 +210,22 @@ fn loadDb() void {
 
     setCount(0);
     var wp: [*]Item = &items;
-    var i: usize = 0;
-    const total: usize = @intCast(n);
+    var bp: [*]const u8 = &buf;
+    var remaining: usize = @intCast(n);
 
-    while (i < total and getCount() < MAX_ITEMS) {
-        const sentinel = buf[i];
-        i += 1;
+    while (remaining > 0 and getCount() < MAX_ITEMS) {
+        const sentinel = bp[0];
+        bp += 1;
+        remaining -= 1;
 
         if (sentinel == 'D' or sentinel == 'T') {
             const addr = @intFromPtr(wp);
             gemz.storeByte(addr + 0, sentinel);
             var t: usize = 0;
-            while (i < total and buf[i] != '\n' and buf[i] != '\r' and t < TEXT_LEN - 1) {
-                gemz.storeByte(addr + 1 + t, buf[i]);
-                i += 1;
+            while (remaining > 0 and bp[0] != '\n' and bp[0] != '\r' and t < TEXT_LEN - 1) {
+                gemz.storeByte(addr + 1 + t, bp[0]);
+                bp += 1;
+                remaining -= 1;
                 t += 1;
             }
             gemz.storeByte(addr + 1 + t, 0);
@@ -223,8 +234,14 @@ fn loadDb() void {
         }
 
         // Skip the rest of this line (whether or not it was a valid item).
-        while (i < total and buf[i] != '\n' and buf[i] != '\r') i += 1;
-        while (i < total and (buf[i] == '\n' or buf[i] == '\r')) i += 1;
+        while (remaining > 0 and bp[0] != '\n' and bp[0] != '\r') {
+            bp += 1;
+            remaining -= 1;
+        }
+        while (remaining > 0 and (bp[0] == '\n' or bp[0] == '\r')) {
+            bp += 1;
+            remaining -= 1;
+        }
     }
 }
 
@@ -237,10 +254,12 @@ fn saveDb() void {
     while (i < getCount()) : (i += 1) {
         p[0] = ip[0].done;
         p += 1;
+        var tp: [*]const u8 = &ip[0].text;
         var t: usize = 0;
-        while (t < TEXT_LEN - 1 and ip[0].text[t] != 0) : (t += 1) {
-            p[0] = ip[0].text[t];
+        while (t < TEXT_LEN - 1 and tp[0] != 0) : (t += 1) {
+            p[0] = tp[0];
             p += 1;
+            tp += 1;
         }
         p[0] = '\n';
         p += 1;
@@ -280,9 +299,11 @@ fn render(app: *MyApp) void {
             gemz.storeByte(base + 3, ']');
             gemz.storeByte(base + 4, ' ');
 
+            var textp: [*]const u8 = &ip[0].text;
             var t: usize = 0;
-            while (t < TEXT_LEN - 1 and ip[0].text[t] != 0) : (t += 1) {
-                gemz.storeByte(base + 5 + t, ip[0].text[t]);
+            while (t < TEXT_LEN - 1 and textp[0] != 0) : (t += 1) {
+                gemz.storeByte(base + 5 + t, textp[0]);
+                textp += 1;
             }
             gemz.storeByte(base + 5 + t, 0);
 
@@ -299,21 +320,11 @@ fn render(app: *MyApp) void {
         si += 1;
     }
 
-    // Status line: task + done counts and the selected index.
-    var dp: [*]Item = &items;
-    var done: u16 = 0;
-    var i: usize = 0;
-    while (i < getCount()) : (i += 1) {
-        if (dp[0].done == 'D') done += 1;
-        dp += 1;
-    }
-
+    // Status line: task count and selected index.
     const sb = @intFromPtr(&status_buf);
     var off: usize = 0;
     off = writeText(sb, off, "TASKS ");
     off = writeDec(sb, off, getCount());
-    off = writeText(sb, off, "   DONE ");
-    off = writeDec(sb, off, done);
     off = writeText(sb, off, "   SEL ");
     off = writeDec(sb, off, if (getCount() == 0) 0 else getCursor() + 1);
     gemz.storeByte(sb + off, 0);
@@ -337,9 +348,11 @@ fn addClicked(app: *MyApp) bool {
 
     const idx = getCount();
     gemz.storeByte(itemAddr(idx) + 0, 'T');
+    var ip: [*]const u8 = &input;
     var t: usize = 0;
-    while (t < TEXT_LEN - 1 and input[t] != 0) : (t += 1) {
-        gemz.storeByte(itemAddr(idx) + 1 + t, input[t]);
+    while (t < TEXT_LEN - 1 and ip[0] != 0) : (t += 1) {
+        gemz.storeByte(itemAddr(idx) + 1 + t, ip[0]);
+        ip += 1;
     }
     gemz.storeByte(itemAddr(idx) + 1 + t, 0);
 

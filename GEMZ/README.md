@@ -10,14 +10,30 @@ project's `build.zig`, target `m68k-freestanding-none`, and import `gemz`.
 
 ## LLM Disclosure
 
-The ideas and inspiration behind GEMZ are based on decades of old skool good fun
-experimentation and hacking.
+The ideas and inspiration behind GEMZ are based on decades of old skool good fun experimentation and hacking.
 
-I have used Deepseek v4-pro quite a bit in this project for the following
+I have used Deepseek v4-pro quite a bit in this project for the following:
+
 - Getting the m68k toolchain for Zig building.
 - Debugging / tracking down bus errors and illegal instructions. Deepseek has been very excellent at mananging this, and its saved a tonne of time finding subtle errors.
 - Rubber ducking discussions on API shape.
-- Writing consistent documentation, because I suck at writing docs.
+- Generating code for functions. Most of the generated code isnt too bad at all after several iterations - but generally requires some rework.
+- Writing consistent documentation, because I suck at writing consitent docs, and dont enjoy that part.
+
+Thoughts on code generation - its not too bad, as long as you keep the scope really really narrow, and be prepared to rewrite / restructure the output to apply 'good taste' before you
+call it done.
+
+Current LLMs are probably nowhere near as bad as they used to be (dont really know), but you still have to babysit it sometimes. Its still time consuming work, with or without LLM help.
+
+For debugging though - oh ... there is no way i would be stepping through disassm and machine opcodes with both the compiled PRG, the data segment, and the ROM the way
+to the bone the way that Deepseek has been able to do here. 
+
+Especially on a machine like an Atari ST, where the smallest crime against the hardware locks the whole thing up, or throws a bus error, making it quite a chore to debug.
+Its also been able to compare Zig IR output to LLVM generated machine code and find & prove a number of persistent miscompilations. Thats hard.
+
+Not saying the LLM is even right half the time ... but man, it really munches through machine code for breakfast. Actually impressive for this use case. 
+
+Of course - YMMV, so you do you.
 
 ---
 
@@ -29,6 +45,7 @@ I have used Deepseek v4-pro quite a bit in this project for the following
 - [GEM: windows and object trees](#gem-windows-and-object-trees)
 - [GEM: bitmaps and images](#gem-bitmaps-and-images)
 - [GEM: text and colours](#gem-text-and-colours)
+- [GEMDOS: files and modal input](#gemdos-files-and-modal-input)
 - [Audio: the YM2149 sequencer](#audio-the-ym2149-sequencer)
 - [Audio: note notation](#audio-note-notation)
 - [Audio: transposing notes](#audio-transposing-notes)
@@ -343,6 +360,38 @@ fields (font, justification, colour) with sane defaults.
 
 ---
 
+## GEMDOS: files and modal input
+
+GEMZ exposes a small set of GEMDOS file calls (`trap #1`) for apps that need
+persistence:
+
+```zig
+const h = gemz.fopen("TODO.db", 0);   // mode 0 = read, 1 = write, 2 = read/write
+if (h >= 0) {
+    var buf: [256]u8 = undefined;
+    const n = gemz.fread(h, &buf, 256);
+    _ = gemz.fclose(h);
+    // n = bytes read, or a negative error
+}
+
+const w = gemz.fcreate("TODO.db");     // create / truncate
+_ = gemz.fwrite(w, "...", 3);
+_ = gemz.fclose(w);
+```
+
+For a single line of user input, `gemz.formInput` builds a tiny `form_do`
+dialog with a `G_FTEXT` field — no keyboard scancode handling in your app:
+
+```zig
+var input: [40]u8 = undefined;
+input[0] = 0;
+if (gemz.formInput("New task:", &input, input.len)) {
+    // input now holds the NUL-terminated answer
+}
+```
+
+---
+
 ## Audio: the YM2149 sequencer
 
 GEMZ includes a three-voice step sequencer for the Atari ST's YM2149 (PSG).
@@ -479,8 +528,10 @@ fragile. These are the failure modes that have actually bitten this project.
    can be dropped. Prefer pointer arithmetic (advance a `[*]u8`), a scalar
    accumulator written once, or a comptime index.
 
-5. **Do not multiply `u32 * u32`.** There is no `__mulsi3` with
-   `-fno-compiler-rt`. Use shifts for doubling/halving.
+5. **`u32 * u32` used to be unavailable** — with `-fno-compiler-rt` there was
+   no `__mulsi3`, so 32-bit multiplies failed to link. GEMZ now provides a
+   68000-safe `__mulsi3` shim, so they link and run; they compile to a slow
+   shift-and-add call, so still prefer shifts for hot doubling/halving paths.
 
 6. **Do not combine comptime recursion with `inline for` over an array of
    structs when the body does struct-field stores.** It has compiled to dead
@@ -489,6 +540,15 @@ fragile. These are the failure modes that have actually bitten this project.
 
 7. **Prefer struct-field stores through `self`** and avoid mutable `var`
    globals for program state.
+
+8. **Do not write bytes into a mutable global buffer** (even via a struct field
+   or a runtime-loaded pointer). The backend constant-folds the address back to
+   the global and emits the illegal `move.b Dn,(d16,PC)` — PC-relative
+   addressing is not a legal store destination. Immediate stores hit it too
+   (`0x31FC → 0x35FC` crashed the counter's `count = 0` at startup). Write the
+   bytes through `gemz.storeByte` / `gemz.storeWord` and confirm the PRG's
+   **text section** contains no `move.{b,w,l} …,(d16,PC)` opcodes
+   (`0x15/25/35` `c0-ff` family) — see `M68K_NOTES.md` for the exact grep.
 
 The rule of thumb: **don't carry a runtime pointer/offset around a loop; prefer
 comptime-fixed addresses.** After any change that touches these shapes,
@@ -535,6 +595,8 @@ by `build.zig` into a `.PRG`.
 
 ### `welcome.zig` → `HELLO.PRG`
 
+**PRG size:** 1051 bytes
+
 The minimal possible app: `_start` shim + `MyApp.init()` +
 `form_alert(...)`.
 
@@ -545,6 +607,8 @@ Worth noting:
 - The alert text is a comptime string literal (see the m68k notes).
 
 ### `window.zig` → `WINDOW.PRG`
+
+**PRG size:** 6168 bytes
 
 A full window demo: object tree, static `TedInfo`, a comptime bitmap logo, and
 button click bindings.
@@ -561,6 +625,8 @@ Worth noting:
 
 ### `daf.zig` → `DAF.PRG`
 
+**PRG size:** 12678 bytes
+
 The big one: a multi-track music sequencer demo (the "Der Mussolini"
 arrangement) plus the equalizer.
 
@@ -576,6 +642,8 @@ Worth noting:
 
 ### `timer_test.zig` → `TIMER.PRG`
 
+**PRG size:** 509 bytes
+
 A standalone diagnostic that cross-checks the system clock against the VBL and
 writes a result file. It deliberately does **not** use the GEMZ abstractions
 for I/O — it's a worked example of raw GEMDOS/XBIOS calls.
@@ -589,6 +657,48 @@ Worth noting:
   argument pushes.
 - The hex formatting writes through a `[*]u8` pointer (`p[0] = ...; p += 1`),
   never an indexed byte store — a direct illustration of the m68k workaround.
+
+### `counter.zig` → `COUNTER.PRG`
+
+**PRG size:** 6319 bytes
+
+A minimal stateful app: a `u16` counter with `+ Increment`, `- Decrement` and
+`Reset` buttons and a live number readout.
+
+Worth noting:
+
+- The number is displayed through a `gemz.TedInfo` pointing at a module-level
+  text buffer, because GEM object trees store pointers that must remain valid.
+- Updating that **global** buffer is exactly the case the m68k backend breaks:
+  a plain `buf.c0 = ...` lowers to an illegal PC-relative store. The fix is
+  `gemz.storeByte`, an inline-asm byte store through an address register.
+- `app.redraw()` repaints the window after each state change.
+
+### `todo.zig` → `TODO.PRG`
+
+**PRG size:** 13317 bytes
+
+A small GEM todo list: add/toggle/delete tasks, move a selection cursor, and
+persist to `TODO.db` (one line per task; the first character is `D` done or
+`T` todo). The window is 380×320 with a title bar, closer, mover and sizer; it
+shows 9 task rows, a coloured header, and a live status footer.
+
+Worth noting:
+
+- All mutable global state (`items`, the visible line buffers, the status line)
+  is written through `gemz.storeByte` / `gemz.storeWord` — never a plain
+  indexed store.
+- Runtime indexing walks pointers with `p += 1`; LLVM may strength-reduce these
+  back into multiplies, which is fine now that GEMZ provides `__mulsi3`.
+- `gemz.formInput` supplies the "New task" prompt (a `form_do` dialog with an
+  editable `G_FTEXT` field).
+- `gemz.fopen` / `fread` / `fcreate` / `fwrite` / `fclose` load and save the
+  database.
+- `TODO.db` is a **relative** path, so it lands in GEMDOS's current directory
+  when the app is launched (typically `C:\GEMZ` or `C:\` depending on how you
+  start it).
+- Line colours are changed at render time via `gemz.storeWord` into each
+  `TedInfo.color`, so done = green, selected = red, todo = black.
 
 ---
 

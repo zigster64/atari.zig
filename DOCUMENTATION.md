@@ -442,6 +442,40 @@ The fix was the sentinel encoding: drum hits are stored as `0xFFF0+` sentinels i
 the existing `notes` word array instead of a separate byte array, eliminating the
 corruption.
 
+### m68k backend: stores to `var` globals misencoded as PC-relative (illegal opcodes)
+
+The backend sometimes emits a store to a *global* (`var x: u32 = 0` at file scope) with
+a PC-relative destination instead of absolute-long, producing **illegal opcodes** that
+write to code memory and crash later with `Illegal instruction` (PC inside `.text`).
+
+Observed misencodings (correct → emitted):
+
+| correct | emitted | meaning |
+|---------|---------|---------|
+| `0x31FC` | `0x35FC` | `move.w #imm,(An)+` → wrong dest mode |
+| `0x157C` | `0x15FC` | `move.b #imm,d16(An)` → `(d16,PC)` |
+| `0x23C1` | `0x25C1` | `move.l Dn,(abs).l` → `(d16,PC)` |
+
+The tell-tale is a destination addressing mode that should be absolute but instead uses
+the PC-relative register sub-field (`010`). The write lands in *code* memory, and the
+corruption surfaces later, often at a different point than the store itself.
+
+**Rule:** don't keep *mutable runtime state* in `var` globals. Put it in the `App`
+struct and access it through the `self` pointer — struct-field stores via `self` are
+the one store form the backend reliably gets right.
+
+### m68k backend: comptime recursion / `inline for` over a comptime array of structs
+
+Arming multiple parts in `playSong` via comptime recursion (or `inline for` over a
+comptime `[]const Part` / `anytype` array) and then writing `self.music[...]` fields
+produced "plays one note then hangs" — the per-part struct-field stores in that code
+shape are miscompiled (the same store-encoding bug, different trigger). `loop()` — a
+plain function writing the *same* fields — works fine; only the comptime-recursion /
+`inline for` arming path breaks.
+
+**Rule:** for multi-part arming, *manually unroll* the per-part calls instead of
+recursing or `inline for`-ing over the comptime part array. (Pending verification.)
+
 ## GEMZ application model (App / Node / View)
 
 `gemz.App(comptime max_views, comptime max_nodes)` is a comptime function that

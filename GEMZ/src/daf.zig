@@ -21,12 +21,12 @@ const DAF_LOGO = gemz.BitBlk.from(&logo_daf.DAF96, .white);
 const mussolini_notes = "e1 b0 d2 b0, b1 b0 b0 b1, b0 b1 b0 b1, a1 b0 b1 b0";
 const mussoliniSong = [_]gemz.Part{
     // Das bassline, with a pitch shift in the middle (down a major third).
-    .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 1, .to_rep = 4 },
-    .{ .channel = .A, .notes = gemz.transpose(mussolini_notes, -4), .volume = 15, .from_rep = 5, .to_rep = 6 },
-    .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 7, .to_rep = 8 },
-    .{ .channel = .A, .notes = gemz.transpose(mussolini_notes, 2), .volume = 15, .from_rep = 9, .to_rep = 9 },
-    .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 10, .to_rep = 12 },
-    // Den Drum Kick starts on the 3rd rep
+    .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 1, .to_rep = 4, .instrument = 1 },
+    .{ .channel = .A, .notes = gemz.transpose(mussolini_notes, -4), .volume = 15, .from_rep = 5, .to_rep = 6, .instrument = 1 },
+    .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 7, .to_rep = 8, .instrument = 1 },
+    .{ .channel = .A, .notes = gemz.transpose(mussolini_notes, 2), .volume = 15, .from_rep = 9, .to_rep = 9, .instrument = 1 },
+    .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 10, .to_rep = 12, .instrument = 1 },
+    // Den Drum Kick starts on the 3rd rep (instrument 0 = no envelope).
     .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . k", .volume = 15, .from_rep = 3, .to_rep = 12 },
     // Und denn das Hat und Snare drum muss gepoken its fingerpicken in den song spielen !
     .{ .channel = .C, .notes = "h h h h s h h h h h h h s h h h", .volume = 8, .from_rep = 5, .to_rep = 12 },
@@ -44,7 +44,7 @@ fn rauber(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Rauber und der Prinz|DAF - Alles ist gut (1981)", " Play | Close ")) {
         // Note - the leading steps with - suffix are half-notes (double steps - so the tone is played for a double duration of 2 steps)
         // Musical notation sucks .. Each set of 4 "steps" here = "1 note" .. so a "half note" actually means 1 beep at double duration ... mkay ?
-        1 => app.loop(.A, "d2- d1- f1- d1- g1- d1- a1 g1 f1 d1", 100, 15),
+        1 => app.play(.A, "d2- d1- f1- d1- g1- d1- a1 g1 f1 d1", .{ .bpm = 100, .instrument = 1, .loop = true }),
         else => {},
     }
     return true;
@@ -52,7 +52,7 @@ fn rauber(app: *MyApp) bool {
 
 fn verschwende(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Verschwende deine Jugend|DAF - Alles ist gut (1981)", " Play | Close ")) {
-        1 => app.loop(.A, "bb3- c3 g3 c3- bb3 c3 g3- bb3 eb3 bb3- g3 bb3", 130, 15),
+        1 => app.play(.A, "bb3- c3 g3 c3- bb3 c3 g3- bb3 eb3 bb3- g3 bb3", .{ .bpm = 130, .instrument = 1, .loop = true }),
         else => {},
     }
     return true;
@@ -60,14 +60,14 @@ fn verschwende(app: *MyApp) bool {
 
 fn liebe(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Liebe aus dem ersten Blick|DAF - Fur immer (1982)", " Play | Close ")) {
-        1 => app.loop(.A, "e1- e2- g1- e2- a1- e2- g1- e1-", 120, 15),
+        1 => app.play(.A, "e1- e2- g1- e2- a1- e2- g1- e1-", .{ .bpm = 120, .instrument = 1, .loop = true }),
         else => {},
     }
     return true;
 }
 
 const satoSong = [_]gemz.Part{
-    .{ .channel = .A, .notes = "a1 . a1 c2  a1 . g1 a1  a1 . a1 f1  g1 . e1 g1", .volume = 15, .from_rep = 1, .to_rep = 16 },
+    .{ .channel = .A, .notes = "a1 . a1 c2  a1 . g1 a1  a1 . a1 f1  g1 . e1 g1", .volume = 15, .from_rep = 1, .to_rep = 16, .instrument = 1 },
     .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . .", .volume = 15, .from_rep = 2, .to_rep = 16 },
     .{ .channel = .C, .notes = ". . h . s . h . . . h . s . h .", .volume = 15, .from_rep = 3, .to_rep = 16 },
 };
@@ -81,7 +81,7 @@ fn sato(app: *MyApp) bool {
 
 fn tot(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Ich bin Tot|DAF - Alles ist gut (1981)", " Play | Close ")) {
-        1 => app.loop(.A, "e1 e2 g1 e2 a1 e2 g1 e2 e1 e2 g1 e2 b1 e2 a1 g1", 116, 15),
+        1 => app.play(.A, "e1 e2 g1 e2 a1 e2 g1 e2 e1 e2 g1 e2 b1 e2 a1 g1", .{ .bpm = 116, .instrument = 1, .loop = true }),
         else => {},
     }
     return true;
@@ -99,6 +99,9 @@ pub fn main() !void {
     var app = try MyApp.init();
     defer app.exit();
 
+    // Instrument 1 = punchy Korg SQ-10 pluck (defined once at boot).
+    app.setInstrument(1, 0x00, 6, .decay);
+    // app.setPercussion(.kick, 22, 31, 0x0300, 0x0D00);
     try app.open(.{
         .kind = .{ .name = true, .closer = true, .mover = true },
         .title = "Deutsch Amerikanische Freundschaft",

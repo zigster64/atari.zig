@@ -21,6 +21,7 @@ I have used DeepSeek v4-pro quite a bit in this project for the following:
 - Debugging / tracking down bus errors and illegal instructions.
 - Rubber ducking discussions on API shape.
 - Generating initial code for functions !!
+- As a resource for music theory, because Im a programmer not a muso, and have nfi what a "half note" actually means.
 - Writing consistent documentation, because I suck at writing consistent docs, and dont enjoy that part at all.
 
 ---
@@ -445,8 +446,8 @@ There are two kinds of instrument:
 // Tone instruments (slots 1-11): the YM2149 hardware envelope.
 app.setInstrument(id, fine, coarse, shape);
 
-// Percussion instruments (slots 12-16): a software voice.
-app.setPercussion(id, burst, noise, tone_start, tone_end);
+// Percussion instruments: a software voice, selected by kind.
+app.setPercussion(.kick, burst, noise, tone_start, tone_end);
 ```
 
 ### Tone instruments (`setInstrument`)
@@ -494,15 +495,17 @@ app.setInstrument(1, 0x00, 6, .decay); // ~197 ms pluck
 
 ### Percussion instruments (`setPercussion`)
 
-Slots **12–16** are reserved for percussion and are pre-seeded with editable
-defaults (see the `kick_*`, `snare_*`, `hat_*`, `tom_*`, `spare_*` constants at
-the top of `src/root.zig`):
+Percussion voices live in reserved slots **12–16**, selected by a
+`gemz.Percussion` enum instead of a raw number:
 
-- **12** = kick
-- **13** = snare
-- **14** = hi-hat
-- **15** = tom-tom
-- **16** = spare
+- `.kick` — slot 12, note token `k`
+- `.snare` — slot 13, note token `s`
+- `.hihat` — slot 14, note token `h`
+- `.tomtom` — slot 15, note token `t`
+- `.custom` — slot 16, note token `x`
+
+They are pre-seeded with editable defaults (see the `kick_*`, `snare_*`,
+`hat_*`, `tom_*`, `custom_*` constants at the top of `src/root.zig`).
 
 Percussion does **not** use the hardware envelope — the chip only has one such
 envelope and the bassline already owns it. Instead GEMZ synthesises each hit in
@@ -512,10 +515,10 @@ software:
 - **`noise`** — noise pitch (`R6`, 0–31; lower = brighter, higher = duller).
 - **`tone_start` / `tone_end`** — for pitched percussion, the tone period is
   swept from `tone_start` down to `tone_end` across the burst (this is what
-  makes a kick "drop"). `0` for both means noise-only.
+  makes a kick "drop"). Both `0` means noise-only.
 
 ```zig
-app.setPercussion(12, 16, 6, 0x0200, 0x0E00); // longer, deeper kick
+app.setPercussion(.kick, 16, 6, 0x0200, 0x0E00); // longer, deeper kick
 ```
 
 ### Experimenting
@@ -535,7 +538,7 @@ Notes are a compact string. Tokens are separated by spaces and/or commas.
 - optional `b` after the letter — flat (`bb` = B-flat).
 - `0`–`3` — octave (octave `0` = scientific octave 1).
 - `.` — rest.
-- `k` / `s` / `h` — kick / snare / hat (percussion hits).
+- `k` / `s` / `h` / `t` / `x` — kick / snare / hat / tomtom / custom (percussion hits).
 - trailing `-` — doubles the duration (`d2-` = 2 steps, `d2--` = 4 steps).
 
 Examples:

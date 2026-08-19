@@ -329,10 +329,51 @@ pub fn storeBytes(dest: usize, src: [*]const u8, comptime len: usize) void {
 // ---------------------------------------------------------------------------
 // GEMDOS file I/O (trap #1)
 // ---------------------------------------------------------------------------
+// GEMDOS file I/O (trap #1)
+// ---------------------------------------------------------------------------
 
-/// GEMDOS Fopen — open an existing file. `mode`: 0 = read, 1 = write,
-/// 2 = read/write. Returns a file handle (>= 0) or a negative GEMDOS error.
-pub fn fopen(name: [*:0]const u8, mode: u16) i32 {
+/// GEMDOS error codes (the negative values returned in d0).
+pub const GemdosError = error{
+    InvalidFunction, // -32
+    FileNotFound, // -33
+    PathNotFound, // -34
+    TooManyHandles, // -35
+    AccessDenied, // -36
+    InvalidHandle, // -37
+    InsufficientMemory, // -39
+    InvalidMemoryBlock, // -40
+    InvalidDrive, // -46
+    RangeError, // -49
+    Unknown,
+};
+
+/// `Fopen` mode: 0 = read, 1 = write, 2 = read/write.
+pub const OpenMode = enum(u16) { read = 0, write = 1, read_write = 2 };
+
+/// `Fseek` origin.
+pub const SeekMode = enum(u16) { start = 0, current = 1, end = 2 };
+
+/// Map a raw GEMDOS return value (negative = error) to an error union.
+fn gemdosResult(r: i32) GemdosError!i32 {
+    if (r < 0) {
+        return switch (r) {
+            -32 => error.InvalidFunction,
+            -33 => error.FileNotFound,
+            -34 => error.PathNotFound,
+            -35 => error.TooManyHandles,
+            -36 => error.AccessDenied,
+            -37 => error.InvalidHandle,
+            -39 => error.InsufficientMemory,
+            -40 => error.InvalidMemoryBlock,
+            -46 => error.InvalidDrive,
+            -49 => error.RangeError,
+            else => error.Unknown,
+        };
+    }
+    return r;
+}
+
+fn fopenRaw(name: [*:0]const u8, mode: u16) i32 {
     var r: i32 = 0;
     asm volatile (
         \\move.w %[mode], -(%%sp)
@@ -349,9 +390,7 @@ pub fn fopen(name: [*:0]const u8, mode: u16) i32 {
     return r;
 }
 
-/// GEMDOS Fcreate — create/truncate a file for writing. Returns a handle or a
-/// negative GEMDOS error.
-pub fn fcreate(name: [*:0]const u8) i32 {
+fn fcreateRaw(name: [*:0]const u8) i32 {
     var r: i32 = 0;
     asm volatile (
         \\move.w #0, -(%%sp)
@@ -367,9 +406,7 @@ pub fn fcreate(name: [*:0]const u8) i32 {
     return r;
 }
 
-/// GEMDOS Fread — read up to `len` bytes into `buf`. Returns bytes read (>= 0)
-/// or a negative GEMDOS error.
-pub fn fread(handle: i32, buf: [*]u8, len: u32) i32 {
+fn freadRaw(handle: i32, buf: [*]u8, len: u32) i32 {
     var r: i32 = 0;
     asm volatile (
         \\move.l %[buf], -(%%sp)
@@ -388,9 +425,7 @@ pub fn fread(handle: i32, buf: [*]u8, len: u32) i32 {
     return r;
 }
 
-/// GEMDOS Fwrite — write `len` bytes from `buf`. Returns bytes written (>= 0)
-/// or a negative GEMDOS error.
-pub fn fwrite(handle: i32, buf: [*]const u8, len: u32) i32 {
+fn fwriteRaw(handle: i32, buf: [*]const u8, len: u32) i32 {
     var r: i32 = 0;
     asm volatile (
         \\move.l %[buf], -(%%sp)
@@ -409,8 +444,7 @@ pub fn fwrite(handle: i32, buf: [*]const u8, len: u32) i32 {
     return r;
 }
 
-/// GEMDOS Fclose — close a handle. Returns 0 on success or a negative error.
-pub fn fclose(handle: i32) i32 {
+fn fcloseRaw(handle: i32) i32 {
     var r: i32 = 0;
     asm volatile (
         \\move.w %[handle], -(%%sp)
@@ -423,6 +457,71 @@ pub fn fclose(handle: i32) i32 {
         : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
     );
     return r;
+}
+
+fn fseekRaw(place: i32, handle: i32, how: u16) i32 {
+    var r: i32 = 0;
+    asm volatile (
+        \\move.w %[how], -(%%sp)
+        \\move.w %[handle], -(%%sp)
+        \\move.l %[place], -(%%sp)
+        \\move.w #0x42, -(%%sp)
+        \\trap #1
+        \\lea 10(%%sp), %%sp
+        \\move.l %%d0, %[r]
+        : [r] "=m" (r),
+        : [how] "d" (@as(u32, how)),
+          [handle] "d" (@as(u32, @bitCast(handle))),
+          [place] "d" (@as(u32, @bitCast(place))),
+        : .{ .memory = true, .ccr = true, .d0 = true, .d1 = true, .d2 = true, .a0 = true, .a1 = true, .a2 = true }
+    );
+    return r;
+}
+
+/// Open an existing file. Returns the handle.
+pub fn openFile(name: [*:0]const u8, mode: OpenMode) GemdosError!i16 {
+    const r = try gemdosResult(fopenRaw(name, @intFromEnum(mode)));
+    return @intCast(r);
+}
+
+/// Create (or truncate) a file for writing. Returns the handle.
+pub fn createFile(name: [*:0]const u8) GemdosError!i16 {
+    const r = try gemdosResult(fcreateRaw(name));
+    return @intCast(r);
+}
+
+/// Read up to `len` bytes into `buf`. Returns bytes read (0 = EOF).
+pub fn read(handle: i16, buf: [*]u8, len: u32) GemdosError!u32 {
+    const r = try gemdosResult(freadRaw(@as(i32, handle), buf, len));
+    return @intCast(r);
+}
+
+/// Write up to `len` bytes from `buf`. Returns bytes written.
+pub fn write(handle: i16, buf: [*]const u8, len: u32) GemdosError!u32 {
+    const r = try gemdosResult(fwriteRaw(@as(i32, handle), buf, len));
+    return @intCast(r);
+}
+
+/// Write all `len` bytes, looping until complete or an error.
+pub fn writeAll(handle: i16, buf: [*]const u8, len: u32) GemdosError!void {
+    var done: u32 = 0;
+    var p = buf;
+    while (done < len) {
+        const n = try write(handle, p, len - done);
+        if (n == 0) return error.Unknown; // GEMDOS shouldn't return 0 for n > 0
+        done += n;
+        p += @intCast(n);
+    }
+}
+
+/// Close a handle.
+pub fn close(handle: i16) GemdosError!void {
+    _ = try gemdosResult(fcloseRaw(@as(i32, handle)));
+}
+
+/// Seek and return the new absolute position. `mode` selects the origin.
+pub fn seek(handle: i16, mode: SeekMode, offset: i32) GemdosError!i32 {
+    return gemdosResult(fseekRaw(offset, @as(i32, handle), @intFromEnum(mode)));
 }
 
 // ---------------------------------------------------------------------------
@@ -579,28 +678,97 @@ fn hz200() u32 {
     return result;
 }
 
-/// How long a percussive drum hit rings, in ticks (10 = 50 ms; crude decay).
-const drum_burst_ticks: u16 = 10;
+/// Percussion defaults, baked into instrument slots 12-16 at boot. Edit these
+/// to tune the drums by ear; `setPercussion` can override them at runtime.
+///
+/// Slots: 12 = kick, 13 = snare, 14 = hi-hat, 15 = tom-tom, 16 = spare.
+const kick_burst: u8 = 12; // hit length in ticks (~15 ms each)
+const kick_noise: u8 = 8; // R6 noise period (0-31)
+const kick_tone_start: u16 = 0x0200; // sweep start (~244 Hz)
+const kick_tone_end: u16 = 0x0E00; // sweep end (~34 Hz)
 
-/// Noise period (R6, 0-31) for the shared noise generator; higher = lower pitch.
-/// One value for all drums for now; per-hit pitch comes later.
-const noise_period: u8 = 8;
+const snare_burst: u8 = 5;
+const snare_noise: u8 = 5;
 
-/// Hardware envelope for punchy song-mode tone notes. The YM2149 has a single
-/// shared envelope generator, so these shape every envelope-mode channel at
-/// once (currently just the song bassline). Decay length ≈
-/// `(256 * env_coarse + env_fine) * 256 / 2 MHz`; `env_coarse = 6` is ~200 ms.
-/// Smaller = snappier, larger = longer. `env_shape` 0x09 = single downward
-/// sawtooth (pluck/decay).
-const env_fine: u8 = 0x00;
-const env_coarse: u8 = 6;
-const env_shape: u8 = 0x09;
+const hat_burst: u8 = 3;
+const hat_noise: u8 = 2;
+
+const tom_burst: u8 = 6;
+const tom_noise: u8 = 4;
+const tom_tone_start: u16 = 0x0600;
+const tom_tone_end: u16 = 0x0A00;
+
+const custom_burst: u8 = 2;
+const custom_noise: u8 = 1;
+
+/// Default noise period written by `playSong` before the first hit (each drum
+/// re-writes R6 to its own value on every trigger).
+const noise_period: u8 = kick_noise;
+
+/// Instrument slots. Slot 0 is reserved: it means "no instrument", i.e. a
+/// plain fixed-volume tone with no hardware envelope. Slots 1-16 are user-
+/// defined via `setInstrument`.
+pub const max_instruments: u8 = 16;
+const instrument_slots: usize = max_instruments + 1;
+
+/// Known YM2149 envelope shapes (register 13). These are the eight distinct
+/// audible shapes; the raw chip also accepts 0x0-0x7, which are the one-shot
+/// variants of the same ramps. `decay` (0x09) is the classic pluck.
+pub const EnvelopeShape = enum(u8) {
+    decay = 0x09, // \______ single downward decay, hold low
+    decay_repeat = 0x08, // \|\|\|\| downward saw, repeat
+    attack = 0x0D, // /------ single upward attack, hold high
+    attack_repeat = 0x0C, // /|/|/|/| upward saw, repeat
+    triangle_down = 0x0A, // \/\/\/\/ down-up triangle, repeat
+    triangle_down_once = 0x0B, // \/ single down-up triangle
+    triangle_up = 0x0E, // /\/\/\/\ up-down triangle, repeat
+    triangle_up_once = 0x0F, // /\ single up-down triangle
+};
+
+/// Percussion instrument kinds. The enum value is the reserved instrument slot,
+/// so `.kick` = 12 … `.custom` = 16. Used by `setPercussion`.
+pub const Percussion = enum(u8) {
+    kick = 12,
+    snare = 13,
+    hihat = 14,
+    tomtom = 15,
+    custom = 16,
+};
+
+/// One instrument: the YM2149 hardware envelope parameters. Decay length ≈
+/// `(256 * coarse + fine) * 256 / 2 MHz`. `shape` is an `EnvelopeShape`.
+pub const Instrument = extern struct {
+    fine: u8 = 0,
+    coarse: u8 = 0,
+    shape: u8 = 0,
+    // Percussion voice (slots 12-16): software decay + sweep, not the
+    // hardware envelope.
+    burst: u8 = 0,
+    noise: u8 = 0,
+    tone_start: u16 = 0,
+    tone_end: u16 = 0,
+};
+
+/// The 16 user instruments (index 0 is the reserved none slot). Written through
+/// `setInstrument` (tone) / `setPercussion` (percussion); read live whenever a
+/// note fires. Slots 12-16 are pre-seeded with the percussion defaults above.
+var instruments: [instrument_slots]Instrument = blk: {
+    var arr: [instrument_slots]Instrument = [_]Instrument{.{}} ** instrument_slots;
+    arr[12] = .{ .burst = kick_burst, .noise = kick_noise, .tone_start = kick_tone_start, .tone_end = kick_tone_end };
+    arr[13] = .{ .burst = snare_burst, .noise = snare_noise };
+    arr[14] = .{ .burst = hat_burst, .noise = hat_noise };
+    arr[15] = .{ .burst = tom_burst, .noise = tom_noise, .tone_start = tom_tone_start, .tone_end = tom_tone_end };
+    arr[16] = .{ .burst = custom_burst, .noise = custom_noise };
+    break :blk arr;
+};
 
 /// Sentinel values stored in `notes[]` for percussive hits. Tone periods are
 /// 12-bit (<= 0x0FFF), so 0xFFF0.. are unambiguous.
 const drum_kick: u16 = 0xFFF0;
 const drum_snare: u16 = 0xFFF1;
 const drum_hat: u16 = 0xFFF2;
+const drum_tom: u16 = 0xFFF3;
+const drum_custom: u16 = 0xFFF4;
 
 /// One sequencer channel: its note buffer + playback state.
 pub const Track = struct {
@@ -610,7 +778,7 @@ pub const Track = struct {
     delay_ticks: u16 = 0, // duration of one beat, in 200 Hz ticks
     remaining: u16 = 0, // ticks until this track's next state change
     volume: u8 = 0, // 0-15
-    vol_reg: u8 = 0, // raw value written to R8/R9/R10 on a tone note (0x10 = hardware envelope)
+    instrument: u8 = 0, // 0 = no envelope; 1-16 = named instrument
     looping: bool = false,
     active: bool = false,
     gate_on: bool = false, // in the silence gap before the next note
@@ -623,6 +791,16 @@ pub const Part = struct {
     volume: u8,
     from_rep: u8, // first rep (1-based)
     to_rep: u8, // last rep inclusive; 0 = until song end
+    instrument: u8 = 0, // 0 = no envelope; 1-16 = named instrument
+};
+
+/// Options for the single-channel `play` function. `channel` and `notes` are
+/// positional parameters; everything here has a sensible default.
+pub const PlayOptions = struct {
+    bpm: u8 = 80,
+    volume: u8 = 15,
+    instrument: u8 = 0,
+    loop: bool = false,
 };
 
 /// Natural-note semitone index (c=0, d=2, e=4, f=5, g=7, a=9, b=11).
@@ -671,11 +849,13 @@ fn parseNotes(comptime src: []const u8) Track {
             } else {
                 i += 1;
             }
-        } else if (c == 'k' or c == 's' or c == 'h') {
+        } else if (c == 'k' or c == 's' or c == 'h' or c == 't' or c == 'x') {
             encoded = switch (c) {
                 'k' => drum_kick,
                 's' => drum_snare,
                 'h' => drum_hat,
+                't' => drum_tom,
+                'x' => drum_custom,
                 else => 0,
             };
             is_step = true;
@@ -844,29 +1024,119 @@ fn stepOnTicks(t: *const Track) u16 {
         if (total > note_gate_ticks) return @intCast(total - note_gate_ticks);
         return 1;
     }
-    return drum_burst_ticks;
+    return drumBurstTicks(v);
 }
 
-/// Comptime scan: does a note string contain any drum token (k/s/h)?
+/// Map a drum sentinel value to its reserved percussion instrument slot:
+/// 12 = kick, 13 = snare, 14 = hi-hat, 15 = tom-tom, 16 = custom.
+fn drumInstrumentId(v: u16) u8 {
+    if (v == drum_snare) return 13;
+    if (v == drum_hat) return 14;
+    if (v == drum_tom) return 15;
+    if (v == drum_custom) return 16;
+    return 12;
+}
+
+/// Stable pointer to the percussion instrument slot for a drum sentinel value.
+fn drumInstrument(v: u16) [*]const Instrument {
+    const p: [*]const Instrument = @ptrFromInt(instrumentAddr(drumInstrumentId(v)));
+    return p;
+}
+
+/// Burst length for a drum sentinel value, in ticks.
+fn drumBurstTicks(v: u16) u16 {
+    return @as(u16, drumInstrument(v)[0].burst);
+}
+
+/// Noise period (R6) for a drum sentinel value. Lower = brighter, higher = duller.
+fn drumNoisePeriod(v: u16) u8 {
+    return drumInstrument(v)[0].noise;
+}
+
+/// Extra low tone period layered under a drum, or 0 for noise-only hits. This
+/// is the sweep *start*; `drumVoiceStep` slides it down to `tone_end` over the
+/// burst for pitched percussion.
+fn drumTonePeriod(v: u16) u16 {
+    return drumInstrument(v)[0].tone_start;
+}
+
+/// Front-loaded pitch sweep for pitched percussion (kick/tom/custom). The
+/// period rises quickly near the start of the hit then flattens out at
+/// `tone_end`, mimicking an analog drum's fast pitch drop.
+fn sweepPeriodAt(v: u16, remaining: u16, total: u16) u16 {
+    const p = drumInstrument(v);
+    const period_start: u32 = p[0].tone_start;
+    const period_end: u32 = p[0].tone_end;
+    if (period_end <= period_start) return @intCast(period_end);
+    const span: u32 = period_end - period_start;
+    const r2: u32 = @as(u32, remaining) * @as(u32, remaining);
+    const t2: u32 = @as(u32, total) * @as(u32, total);
+    const sub: u32 = (span * r2) / t2;
+    return @intCast(period_end - sub);
+}
+
+/// Update a drum hit while it is still ringing: decay the volume toward zero
+/// and (for pitched percussion) sweep the tone period down. Called once per
+/// wake from `stepTrack`, only while a drum note is in its sounding phase.
+fn drumVoiceStep(channel: Channel, t: *const Track, v: u16) void {
+    const total = drumBurstTicks(v);
+    const remaining = t.remaining;
+    const inst = drumInstrument(v);
+    if (inst[0].tone_start != 0 and inst[0].tone_end != 0) {
+        // Pitched percussion: squared volume decay + front-loaded pitch drop.
+        const r2: u32 = @as(u32, remaining) * @as(u32, remaining);
+        const t2: u32 = @as(u32, total) * @as(u32, total);
+        const vol: u8 = @intCast((@as(u32, t.volume) * r2) / t2);
+        psgWriteVolume(channel, vol);
+        psgWritePeriod(channel, sweepPeriodAt(v, remaining, total));
+    } else {
+        // Noise-only (or constant-pitch) percussion: linear decay.
+        const vol: u8 = @intCast((@as(u16, t.volume) * remaining) / total);
+        psgWriteVolume(channel, vol);
+    }
+}
+
+/// Comptime scan: does a note string contain any drum token (k/s/h/t/x)?
 fn hasDrumToken(comptime notes: []const u8) bool {
     var i: usize = 0;
     while (i < notes.len) : (i += 1) {
         const c = notes[i] | 0x20;
-        if (c == 'k' or c == 's' or c == 'h') return true;
+        if (c == 'k' or c == 's' or c == 'h' or c == 't' or c == 'x') return true;
     }
     return false;
 }
 
-/// Comptime: derive the mixer byte (R7) for a song — a channel with drum tokens
-/// gets noise routed to it; a channel with tones gets tone; unused stays muted.
+/// Comptime scan: does a note string contain a pitched percussion token
+/// (k = kick, t = tomtom, x = custom)? These need the tone mixer bit too.
+fn hasPitchedDrumToken(comptime notes: []const u8) bool {
+    var i: usize = 0;
+    while (i < notes.len) : (i += 1) {
+        const c = notes[i] | 0x20;
+        if (c == 'k' or c == 't' or c == 'x') return true;
+    }
+    return false;
+}
+
+/// Comptime: derive the mixer byte (R7) for a song. Tone channels get tone;
+/// drum channels get noise; a pitched-drum channel (kick/tom/custom) also gets
+/// tone so the low body can be layered under the noise. Unused channels stay
+/// muted.
 fn songMixer(comptime parts: anytype) u8 {
     return comptime blk: {
         var mixer: u8 = 0x3F;
         for (parts) |p| {
-            const drums = hasDrumToken(p.notes);
             const ch: u3 = @intCast(@intFromEnum(p.channel));
-            const bit: u3 = if (drums) 3 + ch else ch;
-            mixer &= ~(@as(u8, 1) << bit);
+            if (hasDrumToken(p.notes)) {
+                // Noise on for this channel (mixer bit 0 = enabled).
+                mixer &= ~(@as(u8, 1) << (3 + ch));
+                // Pitched percussion also layers a low tone under the noise.
+                if (hasPitchedDrumToken(p.notes)) {
+                    mixer &= ~(@as(u8, 1) << ch);
+                }
+            } else {
+                // Tone on for tone channels.
+                mixer &= ~(@as(u8, 1) << ch);
+            }
         }
         break :blk mixer | 0xC0;
     };
@@ -915,11 +1185,23 @@ fn psgWriteVolumeRaw(channel: Channel, value: u8) void {
     psgWrite(8 + @intFromEnum(channel), value);
 }
 
-/// Configure the shared YM2149 hardware envelope (R11/R12 = period, R13 = shape).
-fn psgSetEnvelope(fine: u8, coarse: u8, shape: u8) void {
-    psgWrite(11, fine);
-    psgWrite(12, coarse);
-    psgWrite(13, shape);
+/// Address of instrument slot `id` (0 = reserved none slot, 1-16 = user slots),
+/// walked with pointer arithmetic so the backend never indexes a global array.
+fn instrumentAddr(id: u8) usize {
+    var p: [*]Instrument = &instruments;
+    var i: u8 = 0;
+    while (i < id) : (i += 1) p += 1;
+    return @intFromPtr(p);
+}
+
+/// Write instrument `id`'s envelope to the YM2149 (R11/R12/R13). `id` 0 is a
+/// no-op: slot 0 means no envelope.
+fn applyInstrument(id: u8) void {
+    if (id == 0) return;
+    const p: [*]const Instrument = @ptrFromInt(instrumentAddr(id));
+    psgWrite(11, p[0].fine);
+    psgWrite(12, p[0].coarse);
+    psgWrite(13, p[0].shape);
 }
 
 /// Initialise the PSG: tone on for all three channels, noise off.
@@ -1523,8 +1805,10 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
 
         /// Shared track arming: parse the notes, reset state, and sound the first
         /// note. Leaves the mixer untouched (the caller sets tone/noise routing).
-        /// `env` selects hardware-envelope note-on for tone notes (song mode).
-        fn armCore(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8, comptime env: bool) void {
+        /// `instrument` 0 = plain fixed-volume tone; 1-16 = a named instrument
+        /// (hardware envelope) for tone notes. Drums always use their own
+        /// software decay regardless of instrument.
+        fn armCore(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8, instrument: u8) void {
             // Calibrated to the OBSERVED effective rate of the opcode-23 clock
             // (240 bpm input == ~750 ms/step, i.e. ~15 ms/tick): ticks per beat
             // = 60000 ms / (bpm × 15 ms) = 4000 / bpm. Revisit once the true
@@ -1541,55 +1825,69 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             t.delay_ticks = delay_ticks;
             t.remaining = stepOnTicks(t);
             t.volume = volume;
-            t.vol_reg = if (env) 0x10 else volume;
+            t.instrument = instrument;
             t.looping = true;
             t.active = true;
             t.gate_on = false;
             self.emitNote(channel, t); // sound the first note immediately
         }
 
-        /// Start a one-shot note sequence on a channel. `bpm` is the tempo; one
-        /// step = one beat (quarter note). Stops when the sequence ends.
-        pub fn play(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
-            self.song_advancer = null;
-            psgInit(); // simple melodies are tone-only: restore the tone mixer
-            self.armCore(channel, notes, bpm, volume, false);
-            self.music[@intFromEnum(channel)].looping = false; // one-shot
+        /// Define instrument `id` (1-16) as a YM2149 hardware envelope. `fine`/
+        /// `coarse` are the envelope period (smaller = faster decay); `shape` is
+        /// an `EnvelopeShape` (e.g. `.decay` for the classic pluck). Instrument
+        /// 0 is reserved and cannot be set (it always means "no envelope").
+        pub fn setInstrument(_: *Self, id: u8, fine: u8, coarse: u8, shape: EnvelopeShape) void {
+            if (id == 0 or id > max_instruments) return;
+            const a = instrumentAddr(id);
+            storeByte(a + @offsetOf(Instrument, "fine"), fine);
+            storeByte(a + @offsetOf(Instrument, "coarse"), coarse);
+            storeByte(a + @offsetOf(Instrument, "shape"), @intFromEnum(shape));
         }
 
-        /// Start a looping note sequence on a channel. Same as `play` but it
-        /// restarts from the first note when it reaches the end.
-        pub fn loop(self: *Self, channel: Channel, comptime notes: []const u8, bpm: u8, volume: u8) void {
+        /// Define a percussion voice. `kind` selects the reserved slot
+        /// (`.kick` … `.custom`). `burst` is the hit length in ticks; `noise` is
+        /// the R6 noise period; for pitched percussion `tone_start`/`tone_end`
+        /// set the pitch sweep (both 0 = noise-only).
+        pub fn setPercussion(_: *Self, kind: Percussion, burst: u8, noise: u8, tone_start: u16, tone_end: u16) void {
+            const a = instrumentAddr(@intFromEnum(kind));
+            storeByte(a + @offsetOf(Instrument, "burst"), burst);
+            storeByte(a + @offsetOf(Instrument, "noise"), noise);
+            storeWord(a + @offsetOf(Instrument, "tone_start"), tone_start);
+            storeWord(a + @offsetOf(Instrument, "tone_end"), tone_end);
+        }
+
+        /// Start a single-channel note sequence. One step = one beat. `notes` is
+        /// `comptime` so it is parsed at build time (required by the m68k backend
+        /// workaround). `opts` carries tempo/volume/instrument/loop.
+        pub fn play(self: *Self, channel: Channel, comptime notes: []const u8, comptime opts: PlayOptions) void {
             self.song_advancer = null;
             psgInit(); // simple melodies are tone-only: restore the tone mixer
-            self.armCore(channel, notes, bpm, volume, false);
+            self.armCore(channel, notes, opts.bpm, opts.volume, opts.instrument);
+            self.music[@intFromEnum(channel)].looping = opts.loop;
         }
 
         /// Arrange a full song: each part plays on its channel from `from_rep` to
         /// `to_rep`. The master clock is channel A — its loop wraps advance the
         /// rep counter. All parts share the same 16-step / 4-bar grid (one step =
-        /// one beat). `parts` is a comptime array of `Part`.
+        /// one beat). `parts` is a comptime array of `Part`; each part carries its
+        /// own `instrument` slot.
         pub fn playSong(self: *Self, comptime parts: anytype, bpm: u8) void {
             self.song_advancer = repAdvance(parts);
             self.song_bpm = bpm;
             self.song_rep = 1;
-            // Configure the shared envelope before the first note-on; the YM2149
-            // powers up with R11/R12 = 0 (instant decay), which would make the
-            // first envelope-mode note inaudible.
-            psgSetEnvelope(env_fine, env_coarse, env_shape);
             self.armRep(parts, 0, 1, bpm);
             psgWrite(7, songMixer(parts));
             psgWrite(6, noise_period);
         }
 
         /// Comptime-recursive arming for the parts whose `from_rep` equals `rep`.
-        /// Uses `armCore` (not `loop`) so the song mixer written by `playSong`
+        /// Uses `armCore` (not `play`) so the song mixer written by `playSong`
         /// survives rep transitions.
         fn armRep(self: *Self, comptime parts: anytype, comptime i: usize, rep: u8, bpm: u8) void {
             if (i == parts.len) return;
             const p = parts[i];
             if (rep == p.from_rep) {
-                self.armCore(p.channel, p.notes, bpm, p.volume, !hasDrumToken(p.notes));
+                self.armCore(p.channel, p.notes, bpm, p.volume, p.instrument);
             }
             self.armRep(parts, i + 1, rep, bpm);
         }
@@ -1630,17 +1928,23 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
                     psgWriteVolume(channel, 0);
                 } else {
                     psgWritePeriod(channel, period);
-                    // `vol_reg` is 0x10 for envelope-mode tone tracks (song
-                    // bassline) and the fixed 0-15 level otherwise. Writing R13
-                    // restarts the shared envelope; it is harmless on fixed-volume
-                    // channels because their volume register has bit 4 clear.
-                    psgWriteVolumeRaw(channel, t.vol_reg);
-                    psgWrite(13, env_shape);
+                    if (t.instrument == 0) {
+                        // No instrument: plain fixed-volume tone.
+                        psgWriteVolume(channel, t.volume);
+                    } else {
+                        // Named instrument: apply its envelope and route the
+                        // channel volume through the hardware envelope (bit 4).
+                        applyInstrument(t.instrument);
+                        psgWriteVolumeRaw(channel, 0x10);
+                    }
                 }
             } else {
-                // Drum hit: noise is already enabled on this channel (mixer set by
-                // playSong) and R6 is shared; just raise the volume. stepMusic
-                // drops it back to 0 after `stepOnTicks` for a crude percussive decay.
+                // Drum hit. Noise (and, for pitched percussion, the low tone
+                // layer) is already routed by the song mixer; set this hit's
+                // noise pitch, then layer the tone sweep start (0 silences the
+                // tone for noise-only voices on a tone-enabled channel).
+                psgWrite(6, drumNoisePeriod(v));
+                psgWritePeriod(channel, drumTonePeriod(v));
                 psgWriteVolume(channel, t.volume);
             }
         }
@@ -1681,13 +1985,30 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             if (!t.active) return false;
             if (t.remaining > elapsed) {
                 t.remaining -= elapsed;
+                // While a drum hit is ringing (not in its gate), decay its
+                // volume and sweep the kick pitch. Tone notes are left alone:
+                // their decay is owned by the shared hardware envelope.
+                if (!t.gate_on) {
+                    const v = t.notes[t.index];
+                    if (v < drum_kick) {
+                        // tone note sounding — envelope handles it
+                    } else {
+                        drumVoiceStep(chan, t, v);
+                    }
+                }
                 return false;
             }
+            // A phase boundary was crossed. Carry the leftover time into the
+            // next phase instead of throwing it away — the old code discarded
+            // `elapsed - remaining` here, so each channel lost a slightly
+            // different amount every wake and slowly drifted out of synch.
+            const leftover = elapsed - t.remaining;
             if (t.gate_on) {
                 // Gate finished — sound this step.
                 t.gate_on = false;
                 t.remaining = stepOnTicks(t);
                 self.emitNote(chan, t);
+                if (t.remaining > leftover) t.remaining -= leftover;
                 return false;
             }
             // Step finished — silence and begin the gate.
@@ -1699,6 +2020,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
                     t.index = 0;
                     t.gate_on = true;
                     t.remaining = gate;
+                    if (t.remaining > leftover) t.remaining -= leftover;
                     return ch == 0;
                 }
                 psgWriteVolume(chan, 0);
@@ -1707,6 +2029,7 @@ pub fn App(comptime max_views: usize, comptime max_nodes: usize) type {
             }
             t.gate_on = true;
             t.remaining = gate;
+            if (t.remaining > leftover) t.remaining -= leftover;
             return false;
         }
 
@@ -2088,6 +2411,35 @@ export fn __mulsi3(a: u32, b: u32) u32 {
         x <<= 1;
     }
     return result;
+}
+
+/// 32-bit unsigned division for the m68k backend. The 68000 has no native
+/// 32-bit divide, so LLVM lowers `u32 / u32` to a `__udivsi3` call; provide a
+/// 68000-safe shift-and-subtract version (same role as `__mulsi3`).
+export fn __udivsi3(a: u32, b: u32) u32 {
+    if (b == 0) return 0; // GEMZ never divides by zero; avoid a hardware trap
+    var dividend = a;
+    var quotient: u32 = 0;
+    var remainder: u32 = 0;
+    var i: u32 = 32;
+    while (i > 0) : (i -= 1) {
+        remainder = (remainder << 1) | (dividend >> 31);
+        dividend <<= 1;
+        if (remainder < b) {
+            quotient <<= 1;
+        } else {
+            remainder -= b;
+            quotient = (quotient << 1) | 1;
+        }
+    }
+    return quotient;
+}
+
+/// 32-bit unsigned modulo, same deal as `__udivsi3`.
+export fn __umodsi3(a: u32, b: u32) u32 {
+    if (b == 0) return 0;
+    const q = __udivsi3(a, b);
+    return a -% (q *% b);
 }
 
 /// LLVM lowers struct zero-init to `memset`; compiler_rt's version uses

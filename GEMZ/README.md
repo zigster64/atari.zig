@@ -637,10 +637,12 @@ fragile. These are the failure modes that have actually bitten this project.
    can be dropped. Prefer pointer arithmetic (advance a `[*]u8`), a scalar
    accumulator written once, or a comptime index.
 
-5. **`u32 * u32` used to be unavailable** — with `-fno-compiler-rt` there was
-   no `__mulsi3`, so 32-bit multiplies failed to link. GEMZ now provides a
-   68000-safe `__mulsi3` shim, so they link and run; they compile to a slow
-   shift-and-add call, so still prefer shifts for hot doubling/halving paths.
+5. **32-bit multiply/divide used to be unavailable** — with
+   `-fno-compiler-rt` there was no `__mulsi3`/`__udivsi3`/`__umodsi3`, so
+   `u32` arithmetic failed to link. GEMZ now provides 68000-safe shims for all
+   three, so `u32 * u32`, `u32 / u32` and `u32 % u32` link and run; they
+   compile to slow shift-based helper calls, so still prefer shifts for hot
+   doubling/halving paths.
 
 6. **Do not combine comptime recursion with `inline for` over an array of
    structs when the body does struct-field stores.** It has compiled to dead
@@ -663,6 +665,13 @@ fragile. These are the failure modes that have actually bitten this project.
    can lower it to `cmpi.w #0,(d16,PC)` — an illegal instruction, because CMPI
    has no PC-relative form. Load the global into a register first, e.g. via a
    `noinline` getter, and compare the register.
+
+10. **Do not rewrite the sequencer's `stepTrack` as a `while` loop with carried
+    locals.** That shape swapped a null-check branch: `if (self.song_advancer)
+    |adv| adv(...)` executed through null even with the `cmpil #0; beq` guard
+    immediately before it (crashing `TODO.PRG`, which never plays music). Keep
+    the early-return structure and express the leftover-carry with simple
+    conditionals.
 
 The rule of thumb: **don't carry a runtime pointer/offset around a loop; prefer
 comptime-fixed addresses.** After any change that touches these shapes,

@@ -20,7 +20,7 @@ I have used DeepSeek v4-pro quite a bit in this project for the following:
 - As a reference source for looking up GEM APIs, Atari ST memory maps and registers, etc.
 - Debugging / tracking down bus errors and illegal instructions.
 - Rubber ducking discussions on API shape.
-- Generating code for functions.
+- Generating initial code for functions !!
 - Writing consistent documentation, because I suck at writing consistent docs, and dont enjoy that part at all.
 
 ---

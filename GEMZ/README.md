@@ -109,8 +109,7 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-The object-to-PRG pipeline is the part with the most history. The shape that
-works is:
+The object-to-PRG pipeline requires some boilerplate to work:
 
 1. Assemble a tiny **startup trampoline** with GNU `m68k-elf-as` (not LLVM's
    assembler) so the branch at text offset 0 is a 68000-safe `bra.w`, not a

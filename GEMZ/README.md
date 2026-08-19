@@ -16,26 +16,12 @@ The ideas and inspiration behind GEMZ are based on decades of old skool good fun
 
 I have used Deepseek v4-pro quite a bit in this project for the following:
 
-- Getting the m68k toolchain for Zig building.
-- Debugging / tracking down bus errors and illegal instructions. Deepseek has been very excellent at mananging this, and its saved a tonne of time finding subtle errors.
+- Getting the m68k toolchain setup for Zig building, and understanding whats needed.
+- As a reference source for looking up GEM APIs, Atari ST memory maps and registers, etc.
+- Debugging / tracking down bus errors and illegal instructions.
 - Rubber ducking discussions on API shape.
-- Generating code for functions. Most of the generated code isnt too bad at all after several iterations - but generally requires some rework.
-- Writing consistent documentation, because I suck at writing consitent docs, and dont enjoy that part.
-
-Thoughts on code generation - its not too bad, as long as you keep the scope really really narrow, and be prepared to rewrite / restructure the output to apply 'good taste' before you
-call it done.
-
-Current LLMs are probably nowhere near as bad as they used to be (dont really know), but you still have to babysit it sometimes. Its still time consuming work, with or without LLM help.
-
-For debugging though - oh ... there is no way i would be stepping through disassm and machine opcodes with both the compiled PRG, the data segment, and the ROM the way
-to the bone the way that Deepseek has been able to do here. 
-
-Especially on a machine like an Atari ST, where the smallest crime against the hardware locks the whole thing up, or throws a bus error, making it quite a chore to debug.
-Its also been able to compare Zig IR output to LLVM generated machine code and find & prove a number of persistent miscompilations. Thats hard.
-
-Not saying the LLM is even right half the time ... but man, it really munches through machine code for breakfast. Actually impressive for this use case. 
-
-Of course - YMMV, so you do you.
+- Generating code for functions.
+- Writing consistent documentation, because I suck at writing consitent docs, and dont enjoy that part at all.
 
 ---
 
@@ -399,15 +385,19 @@ if (gemz.formInput("New task:", &input, input.len)) {
 GEMZ includes a three-voice step sequencer for the Atari ST's YM2149 (PSG).
 
 ```zig
-// One-shot melody on channel A.
-app.play(.A, "e1 e2 g1 e2", 120, 15);
+// Define instrument 1 once at startup: a punchy downward-sawtooth pluck.
+app.setInstrument(1, 0x00, 6, .decay);
+
+// One-shot melody on channel A (defaults: volume 15, loop false).
+app.play(.A, "e1 e2 g1 e2", .{ .bpm = 120, .instrument = 1 });
 
 // Looping melody on channel A.
-app.loop(.A, "d2- d1- f1- d1-", 100, 15);
+app.play(.A, "d2- d1- f1- d1-", .{ .bpm = 100, .instrument = 1, .loop = true });
 
-// A full multi-channel arrangement with per-part rep scheduling.
+// A full multi-channel arrangement with per-part rep scheduling. Instrument 0
+// is reserved for "no envelope" (plain fixed-volume tone / drums).
 const song = [_]gemz.Part{
-    .{ .channel = .A, .notes = "e1 b0 d2 b0", .volume = 15, .from_rep = 1, .to_rep = 4 },
+    .{ .channel = .A, .notes = "e1 b0 d2 b0", .volume = 15, .from_rep = 1, .to_rep = 4, .instrument = 1 },
     .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . .", .volume = 15, .from_rep = 3, .to_rep = 12 },
 };
 app.playSong(song, 80);
@@ -416,9 +406,16 @@ app.stopMusic();
 ```
 
 - `Channel` is `enum(u8) { A = 0, B = 1, C = 2 }`.
-- `Part` is `{ channel, notes, volume, from_rep, to_rep }`. `from_rep`/`to_rep`
-  are 1-based repetition numbers; a part plays from `from_rep` through
-  `to_rep` inclusive (`to_rep = 0` means "until the song ends").
+- `play(channel, notes, opts)` — `opts` is a `PlayOptions` struct:
+  `{ bpm = 80, volume = 15, instrument = 0, loop = false }`.
+- `setInstrument(id, fine, coarse, shape)` — `shape` is an `EnvelopeShape`:
+  `.decay`, `.decay_repeat`, `.attack`, `.attack_repeat`, `.triangle_down`,
+  `.triangle_down_once`, `.triangle_up`, `.triangle_up_once`. Instrument 0 is
+  reserved and means "no envelope".
+- `Part` is `{ channel, notes, volume, from_rep, to_rep, instrument }`.
+  `from_rep`/`to_rep` are 1-based repetition numbers; a part plays from
+  `from_rep` through `to_rep` inclusive (`to_rep = 0` means "until the song
+  ends"). `instrument` selects a `setInstrument` slot (0 = no envelope).
 - `playSong` treats **channel A as the master clock**: each time A's 16-step
   loop wraps, the rep counter advances and the scheduler arms/stops the parts
   whose `from_rep`/`to_rep` match.
@@ -488,10 +485,15 @@ object tree as a `G_IMAGE`:
 .image(gemz.eqBitBlk(), 44, 110, 232, 12),
 ```
 
-The bitmap is `gemz.eq_w × gemz.eq_h` (232×12). It is driven automatically by
+The bitmap is `gemz.eq_w × gemz.eq_h` (232×12). When wired up, it is driven by
 the sequencer while music is playing; the newest column is sized from channel
 A's current note (taller = higher pitch), and it drops to 0 during gate/silence.
-No extra wiring is required beyond adding the `.image(...)` node.
+
+> **Status:** the equalizer helpers exist in the library, but the `DAF.PRG`
+> wiring is currently commented out. The first attempt redrew the whole object
+> tree every music tick, which made playback unusably slow. Restoring it needs a
+> clipped `objc_change`/`wind_update` repaint of just the `G_IMAGE` node, not a
+> full-tree redraw.
 
 ---
 
@@ -615,7 +617,7 @@ Worth noting:
 
 ### `window.zig` → `WINDOW.PRG`
 
-**PRG size:** 6168 bytes
+**PRG size:** 6926 bytes
 
 A full window demo: object tree, static `TedInfo`, a comptime bitmap logo, and
 button click bindings.
@@ -632,19 +634,21 @@ Worth noting:
 
 ### `daf.zig` → `DAF.PRG`
 
-**PRG size:** 12678 bytes
+**PRG size:** 14590 bytes
 
-The big one: a multi-track music sequencer demo (the "Der Mussolini"
-arrangement) plus the equalizer.
+The big one: a multi-track music sequencer demo (the "Der Mussolini" and
+"Sato Sato" arrangements) with the named-instrument system.
 
 Worth noting:
 
+- `app.setInstrument(1, 0x00, 6, .decay)` defines instrument 1 once at boot;
+  each `Part` and `play` call then references it by number.
 - `gemz.transpose(...)` is used inline to generate the mid-song pitch-shifted
   bassline from the same source string.
 - `gemz.Part`'s `from_rep`/`to_rep` drive the arrangement across repetitions;
   channel A is the master clock.
-- `gemz.eqBitBlk()` is dropped into the object tree as a `G_IMAGE` for the
-  realtime line graph.
+- The equalizer node (`gemz.eqBitBlk()`) is present in the source but currently
+  commented out — the naive per-tick full-tree redraw made playback too slow.
 - `form_choice` presents "Play | Close" and returns the pressed button.
 
 ### `timer_test.zig` → `TIMER.PRG`
@@ -667,7 +671,7 @@ Worth noting:
 
 ### `counter.zig` → `COUNTER.PRG`
 
-**PRG size:** 6319 bytes
+**PRG size:** 7062 bytes
 
 A minimal stateful app: a `u16` counter with `+ Increment`, `- Decrement` and
 `Reset` buttons and a live number readout.
@@ -679,11 +683,12 @@ Worth noting:
 - Updating that **global** buffer is exactly the case the m68k backend breaks:
   a plain `buf.c0 = ...` lowers to an illegal PC-relative store. The fix is
   `gemz.storeByte`, an inline-asm byte store through an address register.
-- `app.redraw()` repaints the window after each state change.
+- `app.redrawNode(1)` repaints only the changed number widget after each state
+  change, avoiding the full-window flash.
 
 ### `todo.zig` → `TODO.PRG`
 
-**PRG size:** 13317 bytes
+**PRG size:** 14183 bytes
 
 A small GEM todo list: add/toggle/delete tasks, move a selection cursor, and
 persist to `TODO.db` (one line per task; the first character is `D` done or
@@ -707,9 +712,58 @@ Worth noting:
 - Line colours are changed at render time via `gemz.storeWord` into each
   `TedInfo.color`, so done = green, selected = red, todo = black.
 
+### `space.zig` → `SPACE.PRG`
+
+**PRG size:** 691 bytes
+
+Fullscreen graphics smoke test: bypasses GEM entirely, saves the desktop
+screen, switches to low resolution (320×200, 16 colours), flashes the
+framebuffer for a few seconds, then restores the desktop and exits.
+
+Worth noting:
+
+- `screen.setScreen(...)` / `screen.vsync()` / `screen.physbase()` / `logbase()`
+  are thin XBIOS (`trap #14`) shims in `screen.zig`.
+- `screen.fillScreen` writes the ST's interleaved bitplane layout with a
+  `[*]u8` pointer walk.
+- The framebuffer is **over-allocated and 256-byte aligned at runtime** — the
+  ST Shifter requires a 256-byte-aligned screen base, but the bare linker only
+  guarantees 4-byte alignment.
+
 ---
 
 ## More detail
 
 For the full, continuously-updated list of m68k backend landmines and the
 verification workflow, see `M68K_NOTES.md` at the repository root.
+
+---
+
+![brain-rot alert](brain-rot.png)
+## Observations on using Deepseek for retro development
+
+Ill state up front that I really dont like the whole AI thing - I dont like the hype, I dont like the brain rot, and I definitely dont like the social and environmental impact.
+
+That Everything-AI skeptisicm is a good part of the reason why hacking on retro machines is appealing in the first place.
+
+But, I have used a lot of Deepseek here anyway, because as a tool for a specific purpose, its technically useful.
+
+Its a bit of a political hot potato talking about this LLM stuff. My 2c opinion here is that if you must use it, then at least be honest about it, and try and be a good ambassador 
+for your workflow choices, if you think they are genuinely useful for some things.
+
+Current LLMs are probably nowhere near as bad as they used to be (dont really know), but you still have to babysit it sometimes. Its still time consuming work, with or without LLM help.
+
+Thoughts on code generation - its not too bad, as long as you keep the scope really really narrow, and be prepared to rewrite / restructure the output to apply 'good taste' before you
+call it done. Its hard to say, sometimes its pretty good, sometimes not so much. I wouldnt recommend you "dont read the code" it outputs, but ... you do you.
+
+For debugging though - oh ... there is no way i would be stepping through disassm and machine opcodes with both the compiled PRG, the data segment, and the ROM all the way
+to the bone the way that Deepseek has been able to do here. Considering for retro machines, holding the entire machine state in LLM context appears to be feasible. 
+
+Especially on a machine like an Atari ST, where the smallest crime against the hardware locks the whole thing up, or throws a bus error, making it quite a chore to debug, because
+the machine can get into a state where you need to hit that reset button.
+
+Its also been able to compare Zig IR output to LLVM generated machine code and find & prove a number of persistent miscompilations. Thats hard and tedious to do manually.
+
+Not saying the LLM is even right half the time ... but man, it really munches through machine code for breakfast. Actually impressive for this use case. 
+
+Of course - YMMV, so you do you.

@@ -14,14 +14,14 @@ project's `build.zig`, target `m68k-freestanding-none`, and import `gemz`.
 
 The ideas and inspiration behind GEMZ are based on decades of old skool good fun experimentation and hacking.
 
-I have used Deepseek v4-pro quite a bit in this project for the following:
+I have used DeepSeek v4-pro quite a bit in this project for the following:
 
 - Getting the m68k toolchain setup for Zig building, and understanding whats needed.
 - As a reference source for looking up GEM APIs, Atari ST memory maps and registers, etc.
 - Debugging / tracking down bus errors and illegal instructions.
 - Rubber ducking discussions on API shape.
 - Generating code for functions.
-- Writing consistent documentation, because I suck at writing consitent docs, and dont enjoy that part at all.
+- Writing consistent documentation, because I suck at writing consistent docs, and dont enjoy that part at all.
 
 ---
 
@@ -35,6 +35,7 @@ I have used Deepseek v4-pro quite a bit in this project for the following:
 - [GEM: text and colours](#gem-text-and-colours)
 - [GEMDOS: files and modal input](#gemdos-files-and-modal-input)
 - [Audio: the YM2149 sequencer](#audio-the-ym2149-sequencer)
+- [Audio: instruments](#audio-instruments)
 - [Audio: note notation](#audio-note-notation)
 - [Audio: transposing notes](#audio-transposing-notes)
 - [Audio: the equalizer](#audio-the-equalizer)
@@ -350,22 +351,30 @@ fields (font, justification, colour) with sane defaults.
 
 ## GEMDOS: files and modal input
 
-GEMZ exposes a small set of GEMDOS file calls (`trap #1`) for apps that need
-persistence:
+GEMZ exposes GEMDOS file calls (`trap #1`) as Zig error unions. Failures
+return a `gemz.GemdosError` (`error.FileNotFound`, `error.InvalidHandle`, …)
+instead of a negative handle/count:
 
 ```zig
-const h = gemz.fopen("TODO.db", 0);   // mode 0 = read, 1 = write, 2 = read/write
-if (h >= 0) {
-    var buf: [256]u8 = undefined;
-    const n = gemz.fread(h, &buf, 256);
-    _ = gemz.fclose(h);
-    // n = bytes read, or a negative error
-}
+const h = try gemz.openFile("TODO.db", .read);
+defer gemz.close(h) catch {};
 
-const w = gemz.fcreate("TODO.db");     // create / truncate
-_ = gemz.fwrite(w, "...", 3);
-_ = gemz.fclose(w);
+var buf: [256]u8 = undefined;
+const n = try gemz.read(h, &buf, 256); // bytes read; 0 = EOF
+
+const w = try gemz.createFile("TODO.db"); // create / truncate
+try gemz.writeAll(w, "...", 3);
+try gemz.close(w);
+
+// seek returns the new absolute position:
+const size = try gemz.seek(h, .end, 0);
 ```
+
+- `openFile(name, mode)` / `createFile(name)` return a handle (`i16`).
+- `mode` is `gemz.OpenMode`: `.read`, `.write`, `.read_write`.
+- `read` / `write` return the byte count (`u32`); `writeAll` loops until done.
+- `seek(handle, mode, offset)` returns the new position; `mode` is
+  `gemz.SeekMode`: `.start`, `.current`, `.end`.
 
 For a single line of user input, `gemz.formInput` builds a tiny `form_do`
 dialog with a `G_FTEXT` field — no keyboard scancode handling in your app:
@@ -422,6 +431,100 @@ app.stopMusic();
 
 The sequencer does not trust the AES timer for tempo; it reads the system clock
 and steps tracks by elapsed ticks.
+
+---
+
+## Audio: instruments
+
+GEMZ has **16 named instrument slots**. Slot **0** is reserved and means "no
+instrument" — a plain fixed-volume tone with no hardware envelope. Every
+`play`/`Part` references an instrument slot.
+
+There are two kinds of instrument:
+
+```zig
+// Tone instruments (slots 1-11): the YM2149 hardware envelope.
+app.setInstrument(id, fine, coarse, shape);
+
+// Percussion instruments (slots 12-16): a software voice.
+app.setPercussion(id, burst, noise, tone_start, tone_end);
+```
+
+### Tone instruments (`setInstrument`)
+
+A tone instrument maps to the YM2149's hardware envelope. It has three
+parameters:
+
+- **`fine`** — low byte of the 16-bit envelope period (`R11`).
+- **`coarse`** — high byte of the 16-bit envelope period (`R12`).
+- **`shape`** — an `EnvelopeShape` (`R13`).
+
+`fine` and `coarse` are not two independent things; together they form one
+16-bit period:
+
+```
+period = coarse * 256 + fine
+```
+
+On the Atari ST's 2 MHz PSG clock the resulting envelope time is roughly:
+
+```
+time ≈ period * 128 µs   =   (coarse * 256 + fine) * 128 µs
+```
+
+So **smaller = faster/snappier**, **larger = slower/longer**. For example
+`coarse = 2` is ~66 ms and `coarse = 6` is ~197 ms. Usually you move `coarse`
+for the main feel and leave `fine` at 0 for fine-trim only.
+
+`shape` selects the envelope waveform (`EnvelopeShape`):
+
+- `.decay` — single downward decay (the classic pluck).
+- `.decay_repeat` — downward saw, repeating.
+- `.attack` — single upward attack.
+- `.attack_repeat` — upward saw, repeating.
+- `.triangle_down` / `.triangle_down_once` — triangle, repeating / one-shot.
+- `.triangle_up` / `.triangle_up_once` — inverted triangle, repeating / one-shot.
+
+Because GEMZ re-triggers the envelope on every tone note, one-shot shapes give
+a fresh pluck per step; repeating shapes keep cycling until the software gate
+silences the channel.
+
+```zig
+app.setInstrument(1, 0x00, 6, .decay); // ~197 ms pluck
+```
+
+### Percussion instruments (`setPercussion`)
+
+Slots **12–16** are reserved for percussion and are pre-seeded with editable
+defaults (see the `kick_*`, `snare_*`, `hat_*`, `tom_*`, `spare_*` constants at
+the top of `src/root.zig`):
+
+- **12** = kick
+- **13** = snare
+- **14** = hi-hat
+- **15** = tom-tom
+- **16** = spare
+
+Percussion does **not** use the hardware envelope — the chip only has one such
+envelope and the bassline already owns it. Instead GEMZ synthesises each hit in
+software:
+
+- **`burst`** — hit length in sequencer ticks (~15 ms each).
+- **`noise`** — noise pitch (`R6`, 0–31; lower = brighter, higher = duller).
+- **`tone_start` / `tone_end`** — for pitched percussion, the tone period is
+  swept from `tone_start` down to `tone_end` across the burst (this is what
+  makes a kick "drop"). `0` for both means noise-only.
+
+```zig
+app.setPercussion(12, 16, 6, 0x0200, 0x0E00); // longer, deeper kick
+```
+
+### Experimenting
+
+The fastest loop is: edit the constants at the top of `src/root.zig` (or call
+`setInstrument` / `setPercussion` at startup), rebuild, and listen. `DAF.PRG`
+uses instrument 1 for its basslines and the 12/13/14 percussion defaults for
+kick/snare/hat, so it's the natural place to audition changes.
 
 ---
 
@@ -704,8 +807,8 @@ Worth noting:
   back into multiplies, which is fine now that GEMZ provides `__mulsi3`.
 - `gemz.formInput` supplies the "New task" prompt (a `form_do` dialog with an
   editable `G_FTEXT` field).
-- `gemz.fopen` / `fread` / `fcreate` / `fwrite` / `fclose` load and save the
-  database.
+- `gemz.openFile` / `read` / `createFile` / `writeAll` / `close` load and save
+  the database (error-union wrappers around the raw GEMDOS traps).
 - `TODO.db` is a **relative** path, so it lands in GEMDOS's current directory
   when the app is launched (typically `C:\GEMZ` or `C:\` depending on how you
   start it).
@@ -740,13 +843,13 @@ verification workflow, see `M68K_NOTES.md` at the repository root.
 ---
 
 ![brain-rot alert](brain-rot.png)
-## Observations on using Deepseek for retro development
+## Observations on using DeepSeek for retro development
 
 Ill state up front that I really dont like the whole AI thing - I dont like the hype, I dont like the brain rot, and I definitely dont like the social and environmental impact.
 
-That Everything-AI skeptisicm is a good part of the reason why hacking on retro machines is appealing in the first place.
+That Everything-AI skepticism is a good part of the reason why hacking on retro machines is appealing in the first place.
 
-But, I have used a lot of Deepseek here anyway, because as a tool for a specific purpose, its technically useful.
+But, I have used a lot of DeepSeek here anyway, because as a tool for a specific purpose, its technically useful.
 
 Its a bit of a political hot potato talking about this LLM stuff. My 2c opinion here is that if you must use it, then at least be honest about it, and try and be a good ambassador 
 for your workflow choices, if you think they are genuinely useful for some things.
@@ -754,10 +857,10 @@ for your workflow choices, if you think they are genuinely useful for some thing
 Current LLMs are probably nowhere near as bad as they used to be (dont really know), but you still have to babysit it sometimes. Its still time consuming work, with or without LLM help.
 
 Thoughts on code generation - its not too bad, as long as you keep the scope really really narrow, and be prepared to rewrite / restructure the output to apply 'good taste' before you
-call it done. Its hard to say, sometimes its pretty good, sometimes not so much. I wouldnt recommend you "dont read the code" it outputs, but ... you do you.
+call it done. Its hard to say, sometimes its pretty good, sometimes not so much. I wouldn't recommend you "dont read the code" it outputs anyway.
 
 For debugging though - oh ... there is no way i would be stepping through disassm and machine opcodes with both the compiled PRG, the data segment, and the ROM all the way
-to the bone the way that Deepseek has been able to do here. Considering for retro machines, holding the entire machine state in LLM context appears to be feasible. 
+to the bone the way that DeepSeek has been able to do here. Considering for retro machines, holding the entire machine state in LLM context appears to be feasible. 
 
 Especially on a machine like an Atari ST, where the smallest crime against the hardware locks the whole thing up, or throws a bus error, making it quite a chore to debug, because
 the machine can get into a state where you need to hit that reset button.

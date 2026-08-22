@@ -395,15 +395,17 @@ Use `u16` word arrays, or encode small enums/flags into spare high bits of an
 existing word. (Scalar `u8`/`bool` fields are fine — the bug is the *indexed*
 byte store, not the byte type.)
 
-### m68k backend: no 32-bit hardware multiply (`__mulsi3`)
-The 68000's `MULU.W` / `MULS.W` only multiply two **16-bit** values. Zig
-`u32 * u32` lowers to a call to the software helper `__mulsi3`, which lives in
-compiler-rt. This project builds with `-fno-compiler-rt` (freestanding), so that
-symbol is never linked → `toslink: undefined reference to '__mulsi3'`.
+### m68k backend: no 32-bit hardware multiply/divide (helpers provided)
+The 68000's `MULU.W` / `MULS.W` only multiply two **16-bit** values, and it has
+no 32-bit divide. Zig lowers `u32 * u32` / `u32 / u32` / `u32 % u32` to
+compiler-rt helpers (`__mulsi3`, `__udivsi3`, `__umodsi3`). This project builds
+with `-fno-compiler-rt` (freestanding), so GEMZ exports 68000-safe Zig versions
+of all three (`__mulsi3` = shift-add, `__udivsi3` = shift-subtract, `__umodsi3`
+wraps it).
 
-**Rule:** avoid `u32 * u32` (and `i32 * i32`). Where the multiplier is a power of
-two, use a shift. Note durations do exactly this: `delay_ms << dashes` instead of
-`delay_ms * beats`.
+**Rule:** 32-bit arithmetic now links and works, but it is a runtime helper
+call, not hardware — keep shifts for the hot doubling/halving paths. Note
+durations still use `delay_ms << dashes` instead of `delay_ms * beats`.
 
 ### YM2149 mixer (register R7) bit map
 The mixer selects, per channel, whether its **tone**, its **noise**, both, or
@@ -423,13 +425,13 @@ There is **one** noise generator (shared; period in R6) but three tone
 generators. Channel volume (R8–R10) is separate — enabling noise in the mixer
 but leaving the channel volume at 0 is still silent.
 
-`playSong` derives the mixer from each part's notes (drum tokens `k/s/h` →
+`playSong` derives the mixer from each part's notes (drum tokens `k/s/h/t/x` →
 noise, otherwise → tone) rather than hardcoding A=tone / B,C=noise. This standard
 map matches observed behaviour (`0xFA` = tone A + tone C) but has not been
 empirically verified against the emulator.
 
 ### Noise-bug post-mortem
-Symptom: after a broken `playSong`, plain `loop()` melodies had "noise on every
+Symptom: after a broken `playSong`, plain `play()` melodies had "noise on every
 beat that blanked on the gate".
 
 The gated behaviour was the tell: the noise was on the *active* tone channel, not
@@ -466,15 +468,37 @@ the one store form the backend reliably gets right.
 
 ### m68k backend: comptime recursion / `inline for` over a comptime array of structs
 
-Arming multiple parts in `playSong` via comptime recursion (or `inline for` over a
-comptime `[]const Part` / `anytype` array) and then writing `self.music[...]` fields
-produced "plays one note then hangs" — the per-part struct-field stores in that code
-shape are miscompiled (the same store-encoding bug, different trigger). `loop()` — a
-plain function writing the *same* fields — works fine; only the comptime-recursion /
-`inline for` arming path breaks.
+A previous rep-scheduling attempt (`findPart`/`packSchedule`/`advanceSchedule`/
+`applySched`) compiled to dead code — the rep counter never incremented and the
+apply function was never called. The current form (`armRep`/`stopRep` recursing
+into a simple `armCore` call) **works**: keep comptime recursion simple, avoid
+`inline for` when struct-field stores are involved, and disassemble to confirm
+the code is actually present.
 
-**Rule:** for multi-part arming, *manually unroll* the per-part calls instead of
-recursing or `inline for`-ing over the comptime part array. (Pending verification.)
+### m68k backend: while-loop step state can swap a null-check branch
+
+Rewriting `stepTrack` as a `while (left > 0)` loop with carried locals (`left`,
+`wrapped`) made **TODO bus-error even though it never plays music**. The crash
+was `jsr (a1)` with `a1 = 0`: `if (self.song_advancer) |adv| adv(...)` ran
+through its null pointer even though the emitted `cmpil #0, d2; beq` guard sat
+immediately before it — the branch condition was effectively wrong for that
+inlined code shape.
+
+**Rule:** for the sequencer hot path, keep the original early-return structure
+and avoid a `while` loop with extra carried state. The synch fix is expressed as
+`const leftover = elapsed - t.remaining;` plus `if (t.remaining > leftover)
+t.remaining -= leftover;` in each branch — same shape as the working code, no
+new loop.
+
+### Sequencer channel drift (B/C vs A)
+
+Tracks B/C drifted out of synch with A over long songs because `stepTrack`
+discarded `elapsed - t.remaining` every time a phase boundary was crossed. Each
+channel crosses boundaries at different times, so each lost a slightly different
+amount per wake; over reps the offsets accumulated.
+
+**Fix:** carry the leftover into the next phase (see above). This keeps all three
+channels advancing at exactly the same rate.
 
 ## GEMZ application model (App / Node / View)
 
@@ -514,6 +538,96 @@ two can't drift.
 `run()` re-reads `views[0..view_count]` every pass: handlers can `app.open(...)`
 mid-run, `WM_CLOSED` swap-removes a view, and the loop exits when the pool
 empties. Messages route by `msg[3]`, clicks by `wind_find`.
+
+## Fullscreen graphics (`screen.zig`)
+
+Fullscreen apps bypass GEM: XBIOS `Vsetscreen` switches resolution/screen base,
+`Vsync` waits for VBL, and the app writes the ST's interleaved 4-plane bitplane
+layout directly.
+
+**Framebuffer alignment gotcha:** the ST Shifter requires the screen base to be
+256-byte aligned, but this bare linker only guarantees 4-byte alignment for
+`.bss` (even with `align(256)` on the Zig symbol). Over-allocate and align at
+runtime instead: `(addr + 255) & ~@as(usize, 255)`.
+
+**Space Invaders post-mortem (crash signatures + what fixed them):**
+
+The first fullscreen game (`SPACE.PRG`) exposed a cluster of m68k-backend
+miscompiles that all presented as "random" crashes whose PC moved every time the
+code changed:
+
+- `Panic: Illegal Instruction` (PC inside `.text`)
+- `Panic: Bus Error` on `rts` (corrupted return address)
+- `Panic: Line F Emulator` (executed data/garbage as a `0xFxxx` coprocessor op)
+
+**The tell:** the reported PC was often a *valid* instruction in the disassembly,
+or landed 2 bytes into one. That means the text in memory had been overwritten —
+a memory-corruption crash, not a bad opcode. Do not trust the panic PC blindly;
+check whether the bytes at that PC match the file before assuming an illegal
+instruction.
+
+**Root cause (double-buffering):** `var front`/`back` plus the swap, fed by two
+runtime `aligned(&buf_a_raw)` / `aligned(&buf_b_raw)` calls, got miscompiled: the
+framebuffer address ended up as `0x18700` instead of `0x20900`/`0x30700`, so
+`clearScreen` wrote over the program's own `.text`. The compiler even swapped the
+two `&buf_*` references (harmless on its own, but a symptom of the same
+reordering bug).
+
+**Fix:** collapse to a single framebuffer and inline the alignment:
+`(@intFromPtr(&buf_raw) + 255) & ~@as(usize, 255)`. No `front`/`back`, no swap.
+Double-buffering is still desirable (single-buffer shows tearing) but must be
+re-approached with the address arithmetic verified by disassembly.
+
+**Palette is mandatory:** framebuffer pixel values are *hardware* colour indices
+(0..15 into the Shifter palette), not the `gemz.Color`/VDI logical indices. The
+GEM desktop palette does not match the `Color` enum, so `BG = .black = 1`
+renders red, not black. Install an explicit 16-word palette via `Setpalette`
+(XBIOS 6) after `Vsetscreen`, mapping `0=white, 1=black, 2=red, ..., 5=cyan`.
+
+**Partially solved — the crash was the toslink displacement bug; the remaining band is a Hatari rendering quirk:**
+
+What the "coloured band at the top" actually was, once `GFX.PRG` (the minimal
+probe) reproduced it:
+
+1. **The app crashed** — EmuTOS showed `Panic: Illegal Instruction` / `Panic:
+   Line F Emulator` (the panic screen waits for a keypress forever, so the
+   machine looks hung and needs a reset). Root cause: a PC-relative reference
+   to `gfx_buf_b` (`.bss + 0x7E00` in a 64 KB `.bss`) crossed the 32 KB signed
+   displacement boundary, toslink emitted a 16-bit displacement the 68000
+   reads as negative, and the fill wrote ~64 KB early — over the TPA and
+   `.text`. **Fixed** by deriving buffer B from buffer A by addition
+   (`b = a + screen_bytes + 256`); see M68K_NOTES.md failure mode 11. The
+   app now runs its full loop with no panic.
+2. **The remaining "band"** — resolved: it was Hatari's *extended VDI
+   resolutions* mode (`bUseExtVdiResolutions = TRUE`). In that mode the
+   desktop/VDI runs at a custom resolution, so a 320x200 app screen only
+   covers part of the display area and the rest renders as leftover
+   content. **Fix:** `bUseExtVdiResolutions = FALSE` (and `nFrameSkips = 0`)
+   in the Hatari config — done in `Configs/hatari.cfg` and
+   `Configs/hatari-st.cfg`. Interactive Hatari must be restarted with
+   `-c ~/Atari/Configs/hatari.cfg` for the fix to apply.
+3. **Resolution switches and the monitor type** — `Vsetscreen(rez=2)`
+   (mono) requires a mono monitor, exactly as on real hardware (GLUE
+   mono-detect). Hatari defaults to a colour monitor; requesting rez 2
+   then **resets the emulated machine** (EmuTOS cold-boots, TOS 1.04 kills
+   the app). Run high-res apps with `--monitor mono` (M68K_NOTES.md #17).
+   With a mono monitor the colour rezes still run but display as
+   monochrome patterns — so the GFX demo shows low/med properly with the
+   default monitor and high with `--monitor mono`.
+
+**Safer fullscreen shapes:**
+
+- Write `clearScreen` as a flat byte loop (index `i`, `plane = (i >> 1) & 3`),
+  not the triple-nested line/group/plane loops.
+- Use `u8` for the plane counter, not `u3` (and cast the shift amount with
+  `@intCast`).
+- Use pointer arithmetic (`p += 1` / `q = p + 1`) instead of `p[1]` indexed byte
+  access.
+
+**Mouse control API added:** `gemz.applInit()` and `gemz.grafMouse(mode)` are now
+public; `GrafMouse.off = 256`, `GrafMouse.on = 257`. `appl_init` leaves the app
+in the busy/hourglass state, so call `grafMouse(GrafMouse.arrow)` or `.off`
+after `applInit`.
 
 ## Tech Debt
 

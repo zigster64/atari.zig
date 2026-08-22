@@ -200,12 +200,11 @@ fn clampScroll() void {
 // ---------------------------------------------------------------------------
 
 fn loadDb() void {
-    const h = gemz.fopen("TODO.db", 0);
-    if (h < 0) return;
+    const h = gemz.openFile("TODO.db", .read) catch return;
+    defer gemz.close(h) catch {};
 
     var buf: [FILE_CAP]u8 = undefined;
-    const n = gemz.fread(h, &buf, FILE_CAP);
-    _ = gemz.fclose(h);
+    const n = gemz.read(h, &buf, FILE_CAP) catch return;
     if (n < 1) return;
 
     setCount(0);
@@ -267,10 +266,9 @@ fn saveDb() void {
     }
 
     const len: u32 = @intCast(@intFromPtr(p) - @intFromPtr(&buf));
-    const h = gemz.fcreate("TODO.db");
-    if (h < 0) return;
-    _ = gemz.fwrite(h, &buf, len);
-    _ = gemz.fclose(h);
+    const h = gemz.createFile("TODO.db") catch return;
+    gemz.writeAll(h, &buf, len) catch {};
+    gemz.close(h) catch {};
 }
 
 // ---------------------------------------------------------------------------

@@ -22,19 +22,20 @@ const mussolini_notes = "e1 b0 d2 b0, b1 b0 b0 b1, b0 b1 b0 b1, a1 b0 b1 b0";
 const mussoliniSong = [_]gemz.Part{
     // Das bassline, with a pitch shift in the middle (down a major third).
     .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 1, .to_rep = 4, .instrument = 1 },
+    .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . k", .volume = 12, .from_rep = 3, .to_rep = 8 },
     .{ .channel = .A, .notes = gemz.transpose(mussolini_notes, -4), .volume = 15, .from_rep = 5, .to_rep = 6, .instrument = 1 },
     .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 7, .to_rep = 8, .instrument = 1 },
     .{ .channel = .A, .notes = gemz.transpose(mussolini_notes, 2), .volume = 15, .from_rep = 9, .to_rep = 9, .instrument = 1 },
     .{ .channel = .A, .notes = mussolini_notes, .volume = 15, .from_rep = 10, .to_rep = 12, .instrument = 1 },
     // Den Drum Kick starts on the 3rd rep (instrument 0 = no envelope).
-    .{ .channel = .B, .notes = "k . . . k . . . k . . . k . . k", .volume = 15, .from_rep = 3, .to_rep = 12 },
     // Und denn das Hat und Snare drum muss gepoken its fingerpicken in den song spielen !
-    .{ .channel = .C, .notes = "h h h h s h h h h h h h s h h h", .volume = 8, .from_rep = 5, .to_rep = 12 },
+    // turn this off for now - its barely audible, and it adds too much work to the loop
+    // .{ .channel = .C, .notes = "h h h h s h h h h h h h s h h h", .volume = 8, .from_rep = 5, .to_rep = 12 },
 };
 
 fn mussolini(app: *MyApp) bool {
     switch (app.form_choice(.default_button, "Der Mussolini|DAF - Alles ist gut (1981)", " Play | Close ")) {
-        1 => app.playSong(mussoliniSong, 90), // 80 bpm = 750 ms/step (calibrated: 4000/bpm in armCore)
+        1 => app.playSong(mussoliniSong, 92), // 80 bpm = 750 ms/step (calibrated: 4000/bpm in armCore)
         else => {},
     }
     return true;
@@ -120,6 +121,14 @@ pub fn main() !void {
         .button(" Sato Sato ", 45, 258, 230, 24, .selectable, &.{.{ .click = sato }}),
         .button(" Ich bin Tot ", 45, 290, 230, 24, .selectable, &.{.{ .click = tot }}),
         .button(" Close ", 45, 322, 230, 24, .flags(&.{ .selectable, .exit }), &.{.{ .click = close }}),
+    });
+
+    // tell the app where to write the Equalizer rectangle ... TODO api is a bit meh, will fix this later by adding a .equalizer() helper
+    app.eqRectangle(.{
+        .x = 44,
+        .y = 110,
+        .w = 232,
+        .h = 12,
     });
 
     app.run();
